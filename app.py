@@ -266,7 +266,7 @@ def hours_since_last_fetch():
 
 @st.cache_data(ttl=900)
 def fetch_price_data(etf_pairs):
-    """Fetch price history from Yahoo Finance. Preserved from original."""
+    """Fetch price history and fundamentals from Yahoo Finance."""
     results = {}
     end = datetime.today()
     start = end - timedelta(days=95)
@@ -281,13 +281,36 @@ def fetch_price_data(etf_pairs):
             w1  = float(close.iloc[-6])  if len(close) >= 6  else now
             m1  = float(close.iloc[-22]) if len(close) >= 22 else now
             m3  = float(close.iloc[-66]) if len(close) >= 66 else now
-            results[ticker] = {
+            vol_30d = float(close.pct_change().tail(22).std() * (252 ** 0.5) * 100) if len(close) >= 5 else None
+            entry = {
                 "current": now,
                 "ret_1w": (now-w1)/w1*100,
                 "ret_1m": (now-m1)/m1*100,
                 "ret_3m": (now-m3)/m3*100,
                 "history": pd.DataFrame({"date":close.index,"price":close.values}),
+                "vol_30d": vol_30d,
+                "high_52w": None, "low_52w": None, "drawdown": None,
+                "year_change": None, "avg_volume_3m": None,
+                "beta": None, "dividend_yield": None,
             }
+            try:
+                fi = yf.Ticker(yahoo).fast_info
+                h52 = getattr(fi, "fifty_two_week_high", None)
+                l52 = getattr(fi, "fifty_two_week_low", None)
+                entry["high_52w"] = float(h52) if h52 else None
+                entry["low_52w"]  = float(l52) if l52 else None
+                entry["drawdown"] = (now / h52 - 1) * 100 if h52 else None
+                yc = getattr(fi, "year_change", None)
+                entry["year_change"] = float(yc) * 100 if yc is not None else None
+                av = getattr(fi, "three_month_average_volume", None)
+                entry["avg_volume_3m"] = int(av) if av else None
+                info = yf.Ticker(yahoo).info
+                entry["beta"] = info.get("beta")
+                dy = info.get("dividendYield")
+                entry["dividend_yield"] = float(dy) * 100 if dy else None
+            except Exception:
+                pass
+            results[ticker] = entry
         except Exception: results[ticker] = None
     return results
 
@@ -348,23 +371,46 @@ Cover every ticker. Raw JSON only — your entire reply must be parseable JSON."
         return {t: {"sentiment": "neutral", "rating": "hold", "news": [], "drivers": ""} for t in etfs}
 
 def generate_analysis(allocs, news, price_data, etfs):
-    """Generate Claude portfolio analysis. Preserved from original."""
+    """Generate Claude portfolio analysis with enriched yfinance fundamentals."""
     client = anthropic.Anthropic(api_key=api_key)
-    alloc_str  = ", ".join(f"{t} {v}%" for t,v in allocs.items())
-    price_str  = "".join(f"{t}: 1W={d['ret_1w']:+.1f}% 1M={d['ret_1m']:+.1f}% 3M={d['ret_3m']:+.1f}%\n" for t,d in price_data.items() if d)
-    sell_list  = [t for t,v in news.items() if v.get("rating")=="sell"]
-    buy_list   = [t for t,v in news.items() if v.get("rating")=="buy"]
-    high_news  = [(t,i["text"]) for t,v in news.items() for i in v.get("news",[]) if isinstance(i,dict) and i.get("impact")=="high"]
+    alloc_str = ", ".join(f"{t} {v}%" for t, v in allocs.items())
+
+    def _fmt(d):
+        parts = [
+            f"1W={d['ret_1w']:+.1f}%",
+            f"1M={d['ret_1m']:+.1f}%",
+            f"3M={d['ret_3m']:+.1f}%",
+        ]
+        if d.get("year_change") is not None:
+            parts.append(f"12M={d['year_change']:+.1f}%")
+        if d.get("high_52w") and d.get("low_52w"):
+            parts.append(f"52wk={d['low_52w']:.2f}–{d['high_52w']:.2f}")
+        if d.get("drawdown") is not None:
+            parts.append(f"drawdown={d['drawdown']:+.1f}%")
+        if d.get("vol_30d") is not None:
+            parts.append(f"vol={d['vol_30d']:.1f}%")
+        if d.get("beta") is not None:
+            parts.append(f"β={d['beta']:.2f}")
+        if d.get("dividend_yield") is not None:
+            parts.append(f"yield={d['dividend_yield']:.2f}%")
+        return " | ".join(parts)
+
+    price_str = "".join(f"{t}: {_fmt(d)}\n" for t, d in price_data.items() if d)
+    sell_list = [t for t, v in news.items() if v.get("rating") == "sell"]
+    buy_list  = [t for t, v in news.items() if v.get("rating") == "buy"]
+    high_news = [(t, i["text"]) for t, v in news.items() for i in v.get("news", [])
+                 if isinstance(i, dict) and i.get("impact") == "high"]
     msg = client.messages.create(
         model="claude-opus-4-7",
         max_tokens=1500,
-        messages=[{"role":"user","content":
-            f"Portfolio analyst. Allocation: {alloc_str}\nPrice: {price_str}\n"
+        messages=[{"role": "user", "content":
+            f"Portfolio analyst. Allocation: {alloc_str}\nPrice & fundamentals:\n{price_str}\n"
             f"Buy signals: {buy_list}\nSell signals: {sell_list}\nHigh-impact news: {high_news}\n"
-            f"Full data: {json.dumps(news)}\n\n"
-            "Write 3 paragraphs: (1) overall health vs momentum and ratings, "
-            "(2) immediate attention items, (3) top 3 watch items with one-line action each. "
-            "Be specific, reference tickers and numbers. No bullets. No preamble."}],
+            f"Full news data: {json.dumps(news)}\n\n"
+            "Write 3 paragraphs: (1) overall portfolio health — reference momentum, drawdown from "
+            "52-week highs, volatility, and yield where relevant; (2) immediate attention items "
+            "citing specific tickers and numbers; (3) top 3 watch items with one-line action each. "
+            "Be specific. No bullets. No preamble."}],
     )
     return msg.content[0].text
 

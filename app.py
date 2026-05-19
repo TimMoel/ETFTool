@@ -324,16 +324,26 @@ def generate_analysis(allocs, news, price_data, etfs):
     buy_list  = [t for t, v in news.items() if v.get("rating") == "buy"]
     high_news = [(t, i["text"]) for t, v in news.items() for i in v.get("news", [])
                  if isinstance(i, dict) and i.get("impact") == "high"]
+    ratings_str = ", ".join(
+        f"{t}:{v.get('rating','hold').upper()}" for t, v in news.items() if v
+    )
+    drivers_str = " | ".join(
+        f"{t}: {v.get('drivers','')}" for t, v in news.items() if v and v.get("drivers")
+    )
     msg = client.messages.create(
-        model="claude-opus-4-7",
-        max_tokens=1500,
+        model="claude-sonnet-4-6",
+        max_tokens=1000,
         messages=[{"role": "user", "content":
-            f"Portfolio analyst. Allocation: {alloc_str}\nPrice & fundamentals:\n{price_str}\n"
-            f"Buy signals: {buy_list}\nSell signals: {sell_list}\nHigh-impact news: {high_news}\n"
-            f"Full news data: {json.dumps(news)}\n\n"
-            "Write 3 paragraphs: (1) overall portfolio health — reference momentum, drawdown from "
-            "52-week highs, volatility, and yield where relevant; (2) immediate attention items "
-            "citing specific tickers and numbers; (3) top 3 watch items with one-line action each. "
+            f"Portfolio analyst. Allocation: {alloc_str}\n"
+            f"Ratings: {ratings_str}\n"
+            f"Price & fundamentals:\n{price_str}\n"
+            f"Buy signals: {buy_list}\nSell signals: {sell_list}\n"
+            f"High-impact news: {high_news}\n"
+            f"Key drivers: {drivers_str}\n\n"
+            "Write 3 concise paragraphs (≤120 words each): "
+            "(1) overall portfolio health citing momentum, drawdown, volatility; "
+            "(2) immediate attention items with specific tickers and numbers; "
+            "(3) top 3 watch items with one-line action each. "
             "Be specific. No bullets. No preamble."}],
     )
     return msg.content[0].text

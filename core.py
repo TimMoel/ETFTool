@@ -108,14 +108,14 @@ def fetch_news_and_ratings_raw(etfs, api_key):
             "Cover every ticker. Raw JSON only — your entire reply must be parseable JSON."
         ),
     }
-    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}]
+    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}]
     model = "claude-sonnet-4-6"
     messages = [user_msg]
-    response = client.messages.create(model=model, max_tokens=3000,
+    response = client.messages.create(model=model, max_tokens=2000,
                                       tools=tools, messages=messages)
     while response.stop_reason == "pause_turn":
         messages = messages + [{"role": "assistant", "content": response.content}]
-        response = client.messages.create(model=model, max_tokens=3000,
+        response = client.messages.create(model=model, max_tokens=2000,
                                           tools=tools, messages=messages)
     text = next((b.text for b in response.content
                  if hasattr(b, "text") and b.text.strip()), "")

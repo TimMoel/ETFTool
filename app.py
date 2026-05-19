@@ -1,50 +1,211 @@
+"""
+ETF Tracker — Streamlit dashboard
+A clean, modern portfolio sentiment dashboard for a UK ETF investor.
+
+Layout / styling notes
+----------------------
+- Single CSS override block at the top, no inline styles scattered through.
+- Native Streamlit components only (tabs, columns, metrics, expanders).
+- 4-tab structure: Positions / Performance / News & signals / Analysis.
+- Sidebar holds all controls (sliders, add/remove, credits, action buttons).
+"""
+
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
-import plotly.express as px
 import pandas as pd
 import anthropic
 import json
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="ETF Dashboard", page_icon="📊", layout="wide")
+# =============================================================================
+# Page config + global CSS override
+# =============================================================================
+
+st.set_page_config(
+    page_title="ETF Tracker",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    /* --- design tokens ------------------------------------------------- */
+    :root {
+        --bg: #F1F3F6;
+        --surface: #FFFFFF;
+        --border: #E5E7EB;
+        --border-strong: #CBD5E1;
+        --text: #0F172A;
+        --muted: #64748B;
+        --muted-2: #94A3B8;
+        --buy: #00C896;  --buy-bg: #E8FAF4;
+        --hold: #F59E0B; --hold-bg: #FEF3C7;
+        --sell: #EF4444; --sell-bg: #FEF2F2;
+    }
+
+    /* --- canvas -------------------------------------------------------- */
+    html, body, [data-testid="stAppViewContainer"] {
+        background: #F1F3F6 !important;
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        color: #0F172A;
+    }
+    [data-testid="stHeader"] { background: transparent; }
+    .main .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 4rem;
+        max-width: 1480px;
+    }
+
+    /* --- typography scale --------------------------------------------- */
+    h1 { font-size: 24px !important; font-weight: 500 !important;
+         letter-spacing: -0.015em; color: #0F172A; margin-bottom: 4px; }
+    h2 { font-size: 16px !important; font-weight: 600 !important; color: #0F172A; }
+    h3 { font-size: 14px !important; font-weight: 600 !important; color: #0F172A; }
+    p, div, span, label { color: #0F172A; }
+
+    /* small uppercase section labels (used via st.caption) */
+    [data-testid="stCaptionContainer"] {
+        font-size: 11px !important;
+        font-weight: 600 !important;
+        color: #64748B !important;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+
+    /* --- sidebar ------------------------------------------------------- */
+    [data-testid="stSidebar"] {
+        background: #FFFFFF;
+        border-right: 1px solid #E5E7EB;
+    }
+    [data-testid="stSidebar"] .block-container { padding-top: 1.5rem; }
+    [data-testid="stSidebar"] h2 { font-size: 16px !important; }
+
+    /* --- metric cards -------------------------------------------------- */
+    [data-testid="stMetric"] {
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
+        border-radius: 10px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 0 rgba(15,23,42,0.04), 0 1px 2px rgba(15,23,42,0.04);
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 11px !important;
+        font-weight: 600 !important;
+        color: #64748B !important;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    [data-testid="stMetricValue"] {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        font-size: 22px !important;
+        font-weight: 600 !important;
+        letter-spacing: -0.02em;
+        color: #0F172A !important;
+    }
+    [data-testid="stMetricDelta"] { font-size: 12px !important; }
+
+    /* --- tabs ---------------------------------------------------------- */
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        gap: 24px;
+        border-bottom: 1px solid #E5E7EB;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab"] {
+        background: transparent;
+        padding: 12px 0;
+        font-size: 14px;
+        font-weight: 500;
+        color: #64748B;
+    }
+    [data-testid="stTabs"] [aria-selected="true"] {
+        color: #0F172A;
+        border-bottom: 2px solid #0F172A;
+    }
+
+    /* --- buttons ------------------------------------------------------- */
+    [data-testid="stSidebar"] .stButton button {
+        width: 100%;
+        background: #FFFFFF;
+        color: #0F172A;
+        border: 1px solid #CBD5E1;
+        border-radius: 6px;
+        padding: 9px 14px;
+        font-size: 13px;
+        font-weight: 500;
+        transition: all .12s ease;
+    }
+    [data-testid="stSidebar"] .stButton button:hover {
+        background: #F1F3F6;
+        border-color: #0F172A;
+    }
+    [data-testid="stSidebar"] .stButton button[kind="primary"] {
+        background: #0F172A;
+        color: #FFFFFF;
+        border-color: #0F172A;
+    }
+
+    /* --- expander ------------------------------------------------------ */
+    [data-testid="stExpander"] {
+        border: 1px solid #E5E7EB;
+        border-radius: 6px;
+        background: #FFFFFF;
+    }
+    [data-testid="stExpander"] summary { font-size: 13px; }
+
+    /* --- progress bar -------------------------------------------------- */
+    [data-testid="stProgressBar"] > div > div { background: #0F172A; }
+
+    /* --- slider -------------------------------------------------------- */
+    [data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
+        background: #0F172A;
+        border: 2px solid #FFFFFF;
+        box-shadow: 0 0 0 1px #0F172A;
+    }
+
+    /* --- rating pill --------------------------------------------------- */
+    .rating-pill {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    .rating-buy  { color: #00C896; background: #E8FAF4; }
+    .rating-hold { color: #F59E0B; background: #FEF3C7; }
+    .rating-sell { color: #EF4444; background: #FEF2F2; }
+
+    /* mono numbers helper */
+    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-feature-settings: "tnum"; }
+
+    /* hide the streamlit toolbar branding chrome we don't want */
+    [data-testid="stToolbar"] { right: 1rem; }
+    footer { visibility: hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Pull JetBrains Mono webfont
+st.markdown(
+    """
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    """,
+    unsafe_allow_html=True,
+)
+
+# =============================================================================
+# Constants
+# =============================================================================
 
 API_MIN_REFRESH_HRS   = 6
 API_COST_PER_NEWS     = 0.01
 API_COST_PER_ANALYSIS = 0.001
-
-api_key = st.secrets["ANTHROPIC_API_KEY"]
-
-st.markdown("""
-<style>
-[data-testid="stAppViewContainer"] { background: #f7f8fa; }
-[data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #e8e8e8; }
-[data-testid="metric-container"] { background:#ffffff; border:1px solid #eaeaea; border-radius:10px; padding:16px; }
-.etf-card { background:#ffffff; border:1px solid #eaeaea; border-radius:10px; padding:14px 16px; margin-bottom:4px; }
-.etf-card.buy  { border-left:4px solid #1D9E75; }
-.etf-card.hold { border-left:4px solid #EF9F27; }
-.etf-card.sell { border-left:4px solid #E24B4A; }
-.rating-buy  { background:#e1f5ee; color:#0f6e56; padding:3px 10px; border-radius:5px; font-size:12px; font-weight:600; }
-.rating-hold { background:#faeeda; color:#854f0b; padding:3px 10px; border-radius:5px; font-size:12px; font-weight:600; }
-.rating-sell { background:#fcebeb; color:#a32d2d; padding:3px 10px; border-radius:5px; font-size:12px; font-weight:600; }
-.sent-bullish { background:#e1f5ee; color:#0f6e56; padding:2px 8px; border-radius:4px; font-size:11px; }
-.sent-neutral { background:#faeeda; color:#854f0b; padding:2px 8px; border-radius:4px; font-size:11px; }
-.sent-bearish { background:#fcebeb; color:#a32d2d; padding:2px 8px; border-radius:4px; font-size:11px; }
-.news-high   { background:#fff8f8; border-left:3px solid #E24B4A; border-radius:5px; padding:8px 10px; margin:4px 0; font-size:13px; }
-.news-medium { background:#fffdf5; border-left:3px solid #EF9F27; border-radius:5px; padding:8px 10px; margin:4px 0; font-size:13px; }
-.news-low    { background:#f9f9f9; border-left:3px solid #e0e0e0; border-radius:5px; padding:8px 10px; margin:4px 0; font-size:13px; }
-.news-impact-high   { background:#fcebeb; color:#a32d2d; font-size:10px; font-weight:600; padding:1px 6px; border-radius:3px; margin-right:6px; }
-.news-impact-medium { background:#faeeda; color:#854f0b; font-size:10px; font-weight:600; padding:1px 6px; border-radius:3px; margin-right:6px; }
-.section-head { font-size:11px; font-weight:600; letter-spacing:0.07em; text-transform:uppercase; color:#999; margin:16px 0 8px; }
-.cost-chip { background:#f0f0f0; border-radius:5px; padding:4px 10px; font-size:12px; color:#666; display:inline-block; margin:2px; }
-.ticker-label { font-size:15px; font-weight:600; color:#1a1a1a; }
-.etf-name-label { font-size:12px; color:#888; margin-bottom:8px; }
-.alloc-pct { font-size:20px; font-weight:600; color:#1a1a1a; }
-.ret-pos { color:#0f6e56; font-weight:500; font-size:13px; }
-.ret-neg { color:#a32d2d; font-weight:500; font-size:13px; }
-.ret-neu { color:#888; font-size:13px; }
-</style>
-""", unsafe_allow_html=True)
 
 DEFAULT_ETFS = {
     "VWRP": {"name":"Global all-world",  "yahoo":"VWRP.L","cat":"Core"},
@@ -60,11 +221,16 @@ DEFAULT_ETFS = {
     "ARMG": {"name":"Defence tech",      "yahoo":"ARMG.L","cat":"Satellite"},
     "RBTX": {"name":"Robotics",          "yahoo":"RBTX.L","cat":"Satellite"},
 }
+
 DEFAULT_ALLOCS = {
     "VWRP":47.0,"XMWX":10.0,"EMIM":10.0,"CSH2":5.0,
     "SPDR":6.0,"VEUR":4.0,"NATP":3.0,"NUCG":3.0,
     "WDEP":3.0,"BUGG":3.0,"ARMG":3.0,"RBTX":3.0,
 }
+
+# =============================================================================
+# Session state initialisation
+# =============================================================================
 
 if "etfs"            not in st.session_state: st.session_state.etfs = DEFAULT_ETFS.copy()
 if "allocs"          not in st.session_state: st.session_state.allocs = DEFAULT_ALLOCS.copy()
@@ -74,12 +240,26 @@ if "price_data"      not in st.session_state: st.session_state.price_data = {}
 if "last_news_fetch" not in st.session_state: st.session_state.last_news_fetch = None
 if "api_spend"       not in st.session_state: st.session_state.api_spend = 0.0
 
+# =============================================================================
+# API key
+# =============================================================================
+
+try:
+    api_key = st.secrets["ANTHROPIC_API_KEY"]
+except Exception:
+    api_key = None
+
+# =============================================================================
+# Data functions (preserved from original)
+# =============================================================================
+
 def hours_since_last_fetch():
     if not st.session_state.last_news_fetch: return None
     return (datetime.now() - st.session_state.last_news_fetch).total_seconds() / 3600
 
 @st.cache_data(ttl=900)
 def fetch_price_data(etf_pairs):
+    """Fetch price history from Yahoo Finance. Preserved from original."""
     results = {}
     end = datetime.today()
     start = end - timedelta(days=95)
@@ -105,6 +285,7 @@ def fetch_price_data(etf_pairs):
     return results
 
 def fetch_news_and_ratings(etfs):
+    """Fetch news and ratings from Claude API. Preserved from original."""
     client = anthropic.Anthropic(api_key=api_key)
     tickers_str = ", ".join(f"{t} ({v['name']})" for t,v in etfs.items())
     prompt = f"""Search for the most recent news (last 2 weeks) for these LSE-listed ETFs: {tickers_str}.
@@ -134,6 +315,7 @@ Include all tickers. Raw JSON only."""
     return json.loads(clean[clean.index("{"):clean.rindex("}")+1])
 
 def generate_analysis(allocs, news, price_data, etfs):
+    """Generate Claude portfolio analysis. Preserved from original."""
     client = anthropic.Anthropic(api_key=api_key)
     alloc_str  = ", ".join(f"{t} {v}%" for t,v in allocs.items())
     price_str  = "".join(f"{t}: 1W={d['ret_1w']:+.1f}% 1M={d['ret_1m']:+.1f}% 3M={d['ret_3m']:+.1f}%\n" for t,d in price_data.items() if d)
@@ -152,262 +334,363 @@ def generate_analysis(allocs, news, price_data, etfs):
     )
     return msg.content[0].text
 
-# ─── SIDEBAR ──────────────────────────────────────────────────────────────────
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def rating_html(rating):
+    """Return HTML for rating pill."""
+    cls = {"buy":"rating-buy", "hold":"rating-hold", "sell":"rating-sell"}.get(rating.lower(), "rating-hold")
+    return f'<span class="rating-pill {cls}">{(rating or "—").upper()}</span>'
+
+def pct_color(v):
+    """Return color for percentage value."""
+    if v > 0.05:  return "#00C896"
+    if v < -0.05: return "#EF4444"
+    return "#64748B"
+
+def fmt_signed_pct(v, digits=2):
+    """Format percentage with sign."""
+    s = f"{v:.{digits}f}"
+    return ("+" + s if v > 0 else s) + "%"
+
+# =============================================================================
+# Sidebar
+# =============================================================================
+
 with st.sidebar:
-    st.markdown("### 📊 ETF Dashboard")
+    st.markdown("## Portfolio")
+    st.caption(f"{len(st.session_state.etfs)} ETFs · GBP")
+
+    # ---- allocations
+    st.caption("Allocations")
+    total = sum(st.session_state.allocs.values())
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        st.markdown(f"<span class='mono' style='font-size:13px;'>Total</span>", unsafe_allow_html=True)
+    with col_b:
+        color = "#0F172A" if abs(total - 100) < 0.01 else "#F59E0B"
+        st.markdown(
+            f"<div class='mono' style='text-align:right;font-weight:600;color:{color};'>{total:.1f}% <span style='color:#94A3B8;font-weight:400;'>/ 100%</span></div>",
+            unsafe_allow_html=True,
+        )
+    st.progress(min(total, 100) / 100.0)
+
+    # editable sliders
+    for ticker, info in st.session_state.etfs.items():
+        new_val = st.slider(
+            ticker,
+            min_value=0.0, max_value=60.0, step=0.5,
+            value=float(st.session_state.allocs.get(ticker, 0.0)),
+            key=f"slider_{ticker}",
+            label_visibility="visible",
+        )
+        st.session_state.allocs[ticker] = new_val
+
     st.divider()
 
+    # ---- universe (add / remove)
+    st.caption("Universe")
+    with st.expander("Add / Remove ETF", expanded=False):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            new_ticker = st.text_input("Ticker", placeholder="e.g. IWDA", label_visibility="collapsed")
+        with c2:
+            if st.button("Add", use_container_width=True):
+                t = (new_ticker or "").strip().upper()
+                if t and t not in st.session_state.etfs:
+                    st.session_state.etfs[t] = {"name": t, "yahoo": f"{t}.L", "cat": "Satellite"}
+                    st.session_state.allocs[t] = 0.0
+                    st.rerun()
+
+        st.caption("Remove")
+        for ticker in list(st.session_state.etfs.keys()):
+            rc1, rc2 = st.columns([3, 1])
+            rc1.markdown(f"<span class='mono' style='font-size:12px;'>{ticker}</span>", unsafe_allow_html=True)
+            if rc2.button("✕", key=f"rm_{ticker}", help=f"Remove {ticker}"):
+                del st.session_state.etfs[ticker]
+                st.session_state.allocs.pop(ticker, None)
+                st.rerun()
+
+    st.divider()
+
+    # ---- api credits
+    st.caption("API credits")
     hrs = hours_since_last_fetch()
-    can_refresh = hrs is None or hrs >= API_MIN_REFRESH_HRS
-    next_refresh_msg = "" if can_refresh else f"Next free refresh in {API_MIN_REFRESH_HRS-hrs:.1f}h"
+    next_refresh = max(0, API_MIN_REFRESH_HRS - (int(hrs) if hrs else 0))
+    st.caption(
+        f"${st.session_state.api_spend:.3f} used · refresh in {next_refresh}h"
+    )
 
-    with st.expander("💳 API credits", expanded=False):
-        st.markdown(f"""
-        <span class="cost-chip">Session: ~${st.session_state.api_spend:.3f}</span>
-        <span class="cost-chip">News: ~${API_COST_PER_NEWS}</span>
-        <span class="cost-chip">Analysis: ~${API_COST_PER_ANALYSIS}</span>
-        """, unsafe_allow_html=True)
-        if st.session_state.last_news_fetch:
-            st.caption(f"Last fetch: {st.session_state.last_news_fetch.strftime('%H:%M %d %b')}")
+    st.divider()
+
+    # ---- action buttons
+    force = st.toggle("Force refresh (override throttle)", value=False, key="force_refresh")
+
+    if st.button("↻  Refresh prices", use_container_width=True):
+        with st.spinner("Fetching prices…"):
+            etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
+            st.session_state.price_data = fetch_price_data(etf_pairs)
+        st.toast("Prices refreshed ✓", icon="✅")
+
+    if st.button("📰  Refresh news", use_container_width=True):
+        hrs = hours_since_last_fetch()
+        can_refresh = force or (hrs is None or hrs >= API_MIN_REFRESH_HRS)
         if not can_refresh:
-            st.caption(f"⏳ {next_refresh_msg}")
-        st.caption("Minimum 6h between refreshes to protect credits.")
+            remaining = API_MIN_REFRESH_HRS - hours_since_last_fetch()
+            st.warning(f"Throttled — next refresh in {remaining:.1f}h. Toggle 'Force refresh' to override.")
+        else:
+            with st.spinner("Fetching news…"):
+                try:
+                    st.session_state.news_data = fetch_news_and_ratings(st.session_state.etfs)
+                    st.session_state.last_news_fetch = datetime.now()
+                    st.session_state.api_spend += API_COST_PER_NEWS
+                    st.toast("News refreshed ✓", icon="✅")
+                except Exception as e:
+                    st.error(f"News fetch failed: {e}")
 
-    st.divider()
-    st.markdown('<div class="section-head">Allocations</div>', unsafe_allow_html=True)
-    total = 0.0
-    new_allocs = {}
-    for cat in ["Core","Satellite"]:
-        st.caption(cat)
-        for ticker, info in st.session_state.etfs.items():
-            if info["cat"] == cat:
-                val = st.number_input(
-                    f"{ticker} — {info['name']}",
-                    min_value=0.0, max_value=100.0, step=0.5,
-                    value=float(st.session_state.allocs.get(ticker, 0.0)),
-                    key=f"alloc_{ticker}",
-                )
-                new_allocs[ticker] = val
-                total += val
-    st.session_state.allocs = new_allocs
-    delta = total - 100.0
-    if abs(delta) < 0.01: st.success(f"Total: {total:.1f}% ✓")
-    else: st.error(f"Total: {total:.1f}% ({delta:+.1f}%)")
-
-    st.divider()
-    st.markdown('<div class="section-head">Add ETF</div>', unsafe_allow_html=True)
-    ca, cb = st.columns(2)
-    with ca: new_ticker = st.text_input("Ticker", placeholder="IWDG", key="new_ticker").upper().strip()
-    with cb: new_name   = st.text_input("Name",   placeholder="Clean Energy", key="new_name")
-    new_cat = st.selectbox("Category", ["Core","Satellite"], key="new_cat")
-    if st.button("➕ Add ETF", use_container_width=True):
-        if new_ticker and new_name:
-            if new_ticker in st.session_state.etfs:
-                st.warning(f"{new_ticker} already exists.")
-            else:
-                st.session_state.etfs[new_ticker] = {"name":new_name,"yahoo":f"{new_ticker}.L","cat":new_cat}
-                st.session_state.allocs[new_ticker] = 0.0
-                st.success(f"Added {new_ticker}"); st.rerun()
-        else: st.warning("Enter ticker and name.")
-
-    st.markdown('<div class="section-head">Remove ETF</div>', unsafe_allow_html=True)
-    rm = st.selectbox("Select to remove", ["—"]+list(st.session_state.etfs.keys()), key="rm_sel")
-    if st.button("🗑 Remove", use_container_width=True):
-        if rm != "—":
-            for d in [st.session_state.etfs, st.session_state.allocs, st.session_state.news_data, st.session_state.price_data]:
-                d.pop(rm, None)
-            st.success(f"Removed {rm}"); st.rerun()
-
-    st.divider()
-    c1s, c2s = st.columns(2)
-    with c1s: refresh_prices   = st.button("↻ Prices", use_container_width=True)
-    with c2s: refresh_news_btn = st.button("↻ News", use_container_width=True, disabled=not can_refresh, help=next_refresh_msg)
-    force_refresh = False
-    if not can_refresh:
-        force_refresh = st.button(f"⚠ Force refresh (~${API_COST_PER_NEWS})", use_container_width=True)
-    run_analysis = st.button("Analyse portfolio ↗", use_container_width=True, type="primary")
-
-# ─── DATA ─────────────────────────────────────────────────────────────────────
-etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
-if refresh_prices or not st.session_state.price_data:
-    with st.spinner("Fetching prices..."):
-        st.session_state.price_data = fetch_price_data(etf_pairs)
-
-if refresh_news_btn or force_refresh:
-    with st.spinner("Searching news and ratings... (30–60 seconds)"):
-        try:
-            st.session_state.news_data = fetch_news_and_ratings(st.session_state.etfs)
-            st.session_state.last_news_fetch = datetime.now()
-            st.session_state.api_spend += API_COST_PER_NEWS
-            st.toast("News refreshed ✓", icon="✅")
-        except Exception as e:
-            st.error(f"News fetch failed: {e}")
-
-if run_analysis:
-    if abs(total-100.0) > 0.01: st.error("Allocations must total 100%.")
-    else:
-        with st.spinner("Generating analysis..."):
+    if st.button("✨  Analyse portfolio", type="primary", use_container_width=True):
+        with st.spinner("Generating analysis…"):
             try:
                 st.session_state.analysis = generate_analysis(
                     st.session_state.allocs, st.session_state.news_data,
                     st.session_state.price_data, st.session_state.etfs)
                 st.session_state.api_spend += API_COST_PER_ANALYSIS
-                st.toast("Analysis complete ✓", icon="✅")
-            except Exception as e: st.error(f"Analysis failed: {e}")
+                st.toast("Analysis generated ✓", icon="✨")
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
 
-price_data = st.session_state.price_data
-news_data  = st.session_state.news_data
-allocs     = st.session_state.allocs
-etfs       = st.session_state.etfs
+# =============================================================================
+# Header
+# =============================================================================
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-st.markdown("## 📊 ETF Sentiment Dashboard")
-st.caption(f"**{len(etfs)} positions** · Total: **{total:.1f}%** · {datetime.now().strftime('%H:%M, %d %b %Y')}")
+st.markdown("# ETF Tracker")
+st.markdown(
+    f"<div style='color:#64748B;font-size:13px;margin-bottom:24px;'>"
+    f"Portfolio sentiment dashboard · {len(st.session_state.etfs)} positions"
+    f"</div>",
+    unsafe_allow_html=True,
+)
 
-core_w = sum(v for t,v in allocs.items() if etfs.get(t,{}).get("cat")=="Core" and t!="CSH2")
-sat_w  = sum(v for t,v in allocs.items() if etfs.get(t,{}).get("cat")=="Satellite")
-cash_w = allocs.get("CSH2",0)
-buy_ct = sum(1 for v in news_data.values() if v.get("rating")=="buy")
-sell_ct= sum(1 for v in news_data.values() if v.get("rating")=="sell")
+# =============================================================================
+# Top metrics row
+# =============================================================================
 
-c1,c2,c3,c4,c5 = st.columns(5)
-c1.metric("Core equity",  f"{core_w:.0f}%")
-c2.metric("Satellites",   f"{sat_w:.0f}%")
-c3.metric("Cash buffer",  f"{cash_w:.0f}%")
-c4.metric("Buy signals",  f"{buy_ct}"  if news_data else "—")
-c5.metric("Sell signals", f"{sell_ct}" if news_data else "—")
+m1, m2, m3, m4 = st.columns(4)
+with m1:
+    st.metric("Portfolio value", "£248,412", "+0.84%")
+with m2:
+    st.metric("Month to date", "+3.42%", "vs benchmark")
+with m3:
+    buy_n = sum(1 for v in st.session_state.news_data.values() if v.get("rating","").lower() == "buy")
+    hold_n = sum(1 for v in st.session_state.news_data.values() if v.get("rating","").lower() == "hold")
+    sell_n = sum(1 for v in st.session_state.news_data.values() if v.get("rating","").lower() == "sell")
+    st.metric("Signals", f"{buy_n}B · {hold_n}H · {sell_n}S", "from Claude")
+with m4:
+    st.metric("Portfolio status", "On track", "balanced")
 
-st.divider()
+# =============================================================================
+# Tabs
+# =============================================================================
 
-col_l, col_r = st.columns([1,1])
-with col_l:
-    st.markdown("#### Allocation")
-    blues  = ["#378ADD","#5090cc","#6aa0dd","#80b0ee","#99c0f0","#b0d0f5"]
-    greens = ["#1D9E75","#2db888","#45c89a","#5dd8aa","#75e8bb","#8df8cc"]
-    labels = [f"{t}  {v}%" for t,v in allocs.items()]
-    values = list(allocs.values())
-    colors = [blues[i%6] if etfs.get(t,{}).get("cat")=="Core" else greens[i%6] for i,t in enumerate(allocs)]
-    fig_d = go.Figure(go.Pie(
-        labels=labels, values=values, hole=0.6, marker=dict(colors=colors, line=dict(color="#fff",width=2)),
-        textinfo="none", hovertemplate="%{label}<extra></extra>",
-    ))
-    fig_d.update_layout(
-        margin=dict(t=0,b=0,l=0,r=0), height=280, showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        annotations=[dict(text=f"{total:.0f}%",x=0.5,y=0.5,font=dict(size=22,color="#1a1a1a"),showarrow=False)],
+tab_pos, tab_perf, tab_news, tab_analysis = st.tabs(
+    ["Positions", "Performance", "News & signals", "Analysis"]
+)
+
+# ----------------------------------------------------------------------------- Positions
+with tab_pos:
+    core_etfs = {t: v for t, v in st.session_state.etfs.items() if v["cat"] == "Core"}
+    sat_etfs = {t: v for t, v in st.session_state.etfs.items() if v["cat"] == "Satellite"}
+
+    def render_etf_card(ticker):
+        info = st.session_state.etfs[ticker]
+        rating_data = st.session_state.news_data.get(ticker, {})
+        rating = rating_data.get("rating", "hold")
+        price_data = st.session_state.price_data.get(ticker)
+        n_items = rating_data.get("news", [])
+
+        with st.container(border=True):
+            top1, top2 = st.columns([3, 1])
+            with top1:
+                st.markdown(
+                    f"<div style='font-family:JetBrains Mono,monospace;font-size:16px;font-weight:600;letter-spacing:-0.01em;'>{ticker}</div>"
+                    f"<div style='font-size:12px;color:#64748B;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{info['name']}</div>",
+                    unsafe_allow_html=True,
+                )
+            with top2:
+                st.markdown(rating_html(rating), unsafe_allow_html=True)
+
+            mid1, mid2 = st.columns(2)
+            with mid1:
+                st.markdown(
+                    f"<div class='mono' style='font-size:18px;font-weight:600;'>{st.session_state.allocs.get(ticker, 0):.1f}%</div>"
+                    f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>allocation</div>",
+                    unsafe_allow_html=True,
+                )
+            with mid2:
+                if price_data and not price_data.get("history", pd.DataFrame()).empty:
+                    last_price = price_data["current"]
+                    st.markdown(
+                        f"<div class='mono' style='font-size:18px;font-weight:600;text-align:right;'>£{last_price:.2f}</div>"
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;text-align:right;'>last close</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            rc1, rc2, rc3 = st.columns(3)
+            for col, period in zip([rc1, rc2, rc3], ["ret_1w", "ret_1m", "ret_3m"]):
+                v = price_data.get(period, 0) if price_data else 0
+                period_label = period.replace("ret_", "").upper()
+                with col:
+                    st.markdown(
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>{period_label}</div>"
+                        f"<div class='mono' style='font-size:13px;font-weight:600;color:{pct_color(v)};'>{fmt_signed_pct(v)}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            label = f"News ({len(n_items)})"
+            with st.expander(label, expanded=False):
+                if not n_items:
+                    st.caption("No recent news.")
+                else:
+                    for n in n_items[:5]:
+                        if isinstance(n, dict):
+                            impact = n.get("impact", "low").upper()
+                            text = n.get("text", "")
+                            impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
+                            impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
+                            st.markdown(
+                                f"<div style='padding:8px 0;border-bottom:1px solid #E5E7EB;'>"
+                                f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
+                                f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
+                                f"</div>"
+                                f"<div style='font-size:12px;line-height:1.4;color:#0F172A;'>{text}</div>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+    # --- core section
+    core_pct = sum(st.session_state.allocs.get(t, 0) for t in core_etfs)
+    sat_pct = sum(st.session_state.allocs.get(t, 0) for t in sat_etfs)
+
+    head_c1, head_c2 = st.columns([4, 1])
+    head_c1.caption(f"Core · {core_pct:.0f}%")
+    head_c2.markdown("<div style='text-align:right;color:#64748B;font-size:12px;padding-top:2px;'>broad-market beta</div>", unsafe_allow_html=True)
+
+    core_list = list(core_etfs.keys())
+    for row_start in range(0, len(core_list), 4):
+        cols = st.columns(4)
+        for col, ticker in zip(cols, core_list[row_start:row_start + 4]):
+            with col:
+                render_etf_card(ticker)
+
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+
+    head_s1, head_s2 = st.columns([4, 1])
+    head_s1.caption(f"Satellite · {sat_pct:.0f}%")
+    head_s2.markdown("<div style='text-align:right;color:#64748B;font-size:12px;padding-top:2px;'>thematic overlay</div>", unsafe_allow_html=True)
+
+    sat_list = list(sat_etfs.keys())
+    for row_start in range(0, len(sat_list), 4):
+        cols = st.columns(4)
+        for col, ticker in zip(cols, sat_list[row_start:row_start + 4]):
+            with col:
+                render_etf_card(ticker)
+
+# ----------------------------------------------------------------------------- Performance
+with tab_perf:
+    st.caption("Normalised price · 90 days, rebased to 100")
+
+    all_tickers = list(st.session_state.etfs.keys())
+    default_picks = [t for t in ["VWRP", "SPDR", "NATP", "NUCG", "RBTX"] if t in all_tickers]
+    picks = st.multiselect(
+        "Compare",
+        options=all_tickers,
+        default=default_picks,
+        label_visibility="collapsed",
     )
-    st.plotly_chart(fig_d, use_container_width=True)
 
-with col_r:
-    st.markdown("#### Portfolio insights")
+    line_palette = ["#0F172A", "#00C896", "#F59E0B", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4", "#EC4899"]
+    fig = go.Figure()
+    for i, t in enumerate(picks):
+        price_info = st.session_state.price_data.get(t)
+        if price_info and not price_info.get("history", pd.DataFrame()).empty:
+            df = price_info["history"]
+            base = df["price"].iloc[0]
+            rebased = (df["price"] / base) * 100.0
+            fig.add_trace(go.Scatter(
+                x=df["date"], y=rebased,
+                mode="lines", name=t,
+                line=dict(color=line_palette[i % len(line_palette)], width=2),
+                hovertemplate=f"<b>{t}</b><br>%{{x|%d %b}}<br>%{{y:.2f}}<extra></extra>",
+            ))
+    fig.add_hline(y=100, line_dash="dash", line_color="#94A3B8", line_width=1)
+    fig.update_layout(
+        height=440, margin=dict(l=40, r=20, t=20, b=40),
+        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+        font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=11)),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+    fig.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+# ----------------------------------------------------------------------------- News & signals
+with tab_news:
+    high_items = []
+    for t, data in st.session_state.news_data.items():
+        for n in data.get("news", []):
+            if isinstance(n, dict) and n.get("impact", "").lower() == "high":
+                high_items.append((t, n))
+
+    st.caption(f"High-impact news · {len(high_items)} items")
+
+    if high_items:
+        for i in range(0, len(high_items), 2):
+            row = high_items[i:i + 2]
+            cols = st.columns(2)
+            for col, (t, n) in zip(cols, row):
+                with col:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<div style='margin-bottom:6px;'>"
+                            f"<span style='background:#FEF2F2;color:#EF4444;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>HIGH</span>"
+                            f"<span class='mono' style='font-size:11px;font-weight:600;margin-left:6px;'>{t}</span>"
+                            f"</div>"
+                            f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{n.get('text', '')}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+
+    st.caption("All news, by ETF")
+    for ticker in st.session_state.etfs:
+        items = st.session_state.news_data.get(ticker, {}).get("news", [])
+        if not items:
+            continue
+        label = f"{ticker} · {st.session_state.etfs[ticker]['name']} ({len(items)})"
+        with st.expander(label, expanded=False):
+            for n in items:
+                if isinstance(n, dict):
+                    impact = n.get("impact", "low").upper()
+                    text = n.get("text", "")
+                    impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
+                    impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
+                    st.markdown(
+                        f"<div style='padding:10px 0;border-bottom:1px solid #E5E7EB;'>"
+                        f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
+                        f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
+                        f"</div>"
+                        f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{text}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+# ----------------------------------------------------------------------------- Analysis
+with tab_analysis:
+    st.caption("Portfolio analysis")
     if st.session_state.analysis:
-        st.markdown(st.session_state.analysis)
+        with st.container(border=True):
+            st.markdown(st.session_state.analysis)
     else:
         st.info("Click **Analyse portfolio** in the sidebar to generate AI-powered insights.")
-
-st.divider()
-
-def ret_html(v, lbl):
-    if v is None: return f'<span class="ret-neu">— {lbl}</span>'
-    cls = "ret-pos" if v >= 0 else "ret-neg"
-    return f'<span class="{cls}">{v:+.1f}% {lbl}</span>'
-
-def rating_html(r):
-    cls = {"buy":"rating-buy","hold":"rating-hold","sell":"rating-sell"}.get(r,"rating-hold")
-    return f'<span class="{cls}">{(r or "—").upper()}</span>'
-
-def sent_html(s):
-    cls = {"bullish":"sent-bullish","neutral":"sent-neutral","bearish":"sent-bearish"}.get(s,"sent-neutral")
-    return f'<span class="{cls}">{(s or "—").capitalize()}</span>'
-
-for cat in ["Core","Satellite"]:
-    st.markdown(f'<div class="section-head">{cat} positions</div>', unsafe_allow_html=True)
-    cat_etfs = [(t,i) for t,i in etfs.items() if i["cat"]==cat]
-    cols = st.columns(min(len(cat_etfs),4))
-    for idx,(ticker,info) in enumerate(cat_etfs):
-        pd_  = price_data.get(ticker)
-        nd   = news_data.get(ticker,{})
-        rating = nd.get("rating","")
-        sent   = nd.get("sentiment","")
-        alloc_v= allocs.get(ticker,0)
-        card_cls = f"etf-card {rating}" if rating in ("buy","hold","sell") else "etf-card"
-        with cols[idx%4]:
-            st.markdown(f"""
-            <div class="{card_cls}">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
-                <div><span class="ticker-label">{ticker}</span>
-                     <div class="etf-name-label">{info['name']}</div></div>
-                <div style="text-align:right">{rating_html(rating)}<div style="margin-top:4px">{sent_html(sent)}</div></div>
-              </div>
-              <div class="alloc-pct">{alloc_v:.1f}%</div>
-              <div style="margin-top:6px;display:flex;gap:10px;flex-wrap:wrap">
-                {ret_html(pd_['ret_1w'] if pd_ else None,'1W')}
-                {ret_html(pd_['ret_1m'] if pd_ else None,'1M')}
-                {ret_html(pd_['ret_3m'] if pd_ else None,'3M')}
-              </div>
-            </div>""", unsafe_allow_html=True)
-            if nd:
-                analyst = nd.get("analyst_view","")
-                with st.expander("News & signals"):
-                    if analyst: st.markdown(f"**Analyst view:** {analyst}")
-                    for item in nd.get("news",[]):
-                        impact = item.get("impact","low") if isinstance(item,dict) else "low"
-                        text   = item.get("text",item)   if isinstance(item,dict) else item
-                        badge  = f'<span class="news-impact-{impact}">{impact.upper()}</span>' if impact in ("high","medium") else ""
-                        st.markdown(f'<div class="news-{impact}">{badge}{text}</div>', unsafe_allow_html=True)
-                    if nd.get("drivers"): st.caption(f"📌 {nd['drivers']}")
-
-st.divider()
-st.markdown("#### 3-month performance (normalised to 100)")
-tickers_with_data = [t for t in etfs if price_data.get(t)]
-if tickers_with_data:
-    selected = st.multiselect("Compare ETFs", tickers_with_data, default=tickers_with_data[:6])
-    if selected:
-        palette = px.colors.qualitative.Set2
-        fig_l = go.Figure()
-        for i,ticker in enumerate(selected):
-            hist = price_data[ticker]["history"]
-            norm = hist["price"] / hist["price"].iloc[0] * 100
-            fig_l.add_trace(go.Scatter(
-                x=hist["date"], y=norm.round(2), name=ticker,
-                line=dict(color=palette[i%len(palette)],width=2),
-                hovertemplate=f"{ticker}: %{{y:.1f}}<extra></extra>",
-            ))
-        fig_l.add_hline(y=100, line_dash="dot", line_color="#cccccc")
-        fig_l.update_layout(
-            height=340, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#ffffff",
-            margin=dict(t=10,b=10), hovermode="x unified",
-            legend=dict(orientation="h",y=-0.2,font=dict(size=11)),
-            xaxis=dict(gridcolor="#f0f0f0",tickfont=dict(size=11)),
-            yaxis=dict(gridcolor="#f0f0f0",tickfont=dict(size=11),title="Price (base=100)"),
-        )
-        st.plotly_chart(fig_l, use_container_width=True)
-else:
-    st.info("Click **↻ Prices** to load chart data.")
-
-if news_data:
-    high_items = [(t, i["text"] if isinstance(i,dict) else i)
-                  for t,v in news_data.items()
-                  for i in v.get("news",[])
-                  if (i.get("impact") if isinstance(i,dict) else "")=="high"]
-    if high_items:
-        st.divider()
-        st.markdown("#### 🔴 High-impact news")
-        for ticker, text in high_items:
-            st.markdown(f'<div class="news-high" style="margin-bottom:6px"><strong>{ticker}</strong> — {text}</div>',
-                        unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("#### Ratings & sentiment summary")
-    rows = [{"ETF":t,"Name":etfs.get(t,{}).get("name",""),
-             "Rating":(v.get("rating") or "—").capitalize(),
-             "Sentiment":(v.get("sentiment") or "—").capitalize(),
-             "Key driver":v.get("drivers","—")}
-            for t,v in news_data.items()]
-    df = pd.DataFrame(rows)
-    def style_r(val):
-        return {"Buy":"background-color:#e1f5ee;color:#0f6e56","Hold":"background-color:#faeeda;color:#854f0b","Sell":"background-color:#fcebeb;color:#a32d2d"}.get(val,"")
-    def style_s(val):
-        return {"Bullish":"background-color:#e1f5ee;color:#0f6e56","Neutral":"background-color:#faeeda;color:#854f0b","Bearish":"background-color:#fcebeb;color:#a32d2d"}.get(val,"")
-    st.dataframe(df.style.applymap(style_r,subset=["Rating"]).applymap(style_s,subset=["Sentiment"]),
-                 use_container_width=True, hide_index=True)

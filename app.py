@@ -13,10 +13,15 @@ Layout / styling notes
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
 import anthropic
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as _date
+
+import db
+import signals as sg
+import core
 
 # =============================================================================
 # Page config + global CSS override
@@ -243,9 +248,14 @@ if "allocs"          not in st.session_state: st.session_state.allocs = DEFAULT_
 if "news_data"       not in st.session_state: st.session_state.news_data = {}
 if "analysis"        not in st.session_state: st.session_state.analysis = ""
 if "price_data"      not in st.session_state: st.session_state.price_data = {}
+if "signals_data"    not in st.session_state: st.session_state.signals_data = {}
+if "changes"         not in st.session_state: st.session_state.changes = []
 if "last_news_fetch" not in st.session_state: st.session_state.last_news_fetch = None
 if "api_spend"       not in st.session_state: st.session_state.api_spend = 0.0
 if "portfolio_value" not in st.session_state: st.session_state.portfolio_value = 248412.0
+
+# Make sure the snapshot DB schema exists on first run.
+db.init_db()
 
 # =============================================================================
 # API key
@@ -266,106 +276,13 @@ def hours_since_last_fetch():
 
 @st.cache_data(ttl=900)
 def fetch_price_data(etf_pairs):
-    """Fetch price history and fundamentals from Yahoo Finance."""
-    results = {}
-    end = datetime.today()
-    start = end - timedelta(days=95)
-    for ticker, yahoo in etf_pairs:
-        try:
-            raw = yf.download(yahoo, start=start, end=end, progress=False, auto_adjust=True)
-            if raw.empty: results[ticker] = None; continue
-            if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
-            close = raw["Close"].dropna()
-            if len(close) < 2: results[ticker] = None; continue
-            now = float(close.iloc[-1])
-            w1  = float(close.iloc[-6])  if len(close) >= 6  else now
-            m1  = float(close.iloc[-22]) if len(close) >= 22 else now
-            m3  = float(close.iloc[-66]) if len(close) >= 66 else now
-            vol_30d = float(close.pct_change().tail(22).std() * (252 ** 0.5) * 100) if len(close) >= 5 else None
-            entry = {
-                "current": now,
-                "ret_1w": (now-w1)/w1*100,
-                "ret_1m": (now-m1)/m1*100,
-                "ret_3m": (now-m3)/m3*100,
-                "history": pd.DataFrame({"date":close.index,"price":close.values}),
-                "vol_30d": vol_30d,
-                "high_52w": None, "low_52w": None, "drawdown": None,
-                "year_change": None, "avg_volume_3m": None,
-                "beta": None, "dividend_yield": None,
-            }
-            try:
-                fi = yf.Ticker(yahoo).fast_info
-                h52 = getattr(fi, "fifty_two_week_high", None)
-                l52 = getattr(fi, "fifty_two_week_low", None)
-                entry["high_52w"] = float(h52) if h52 else None
-                entry["low_52w"]  = float(l52) if l52 else None
-                entry["drawdown"] = (now / h52 - 1) * 100 if h52 else None
-                yc = getattr(fi, "year_change", None)
-                entry["year_change"] = float(yc) * 100 if yc is not None else None
-                av = getattr(fi, "three_month_average_volume", None)
-                entry["avg_volume_3m"] = int(av) if av else None
-                info = yf.Ticker(yahoo).info
-                entry["beta"] = info.get("beta")
-                dy = info.get("dividendYield")
-                entry["dividend_yield"] = float(dy) * 100 if dy else None
-            except Exception:
-                pass
-            results[ticker] = entry
-        except Exception: results[ticker] = None
-    return results
+    """Cached Streamlit wrapper around core.fetch_price_data_raw."""
+    return core.fetch_price_data_raw(etf_pairs)
 
 def fetch_news_and_ratings(etfs):
-    """Fetch news and ratings using Haiku + web search (budget-capped at ~$0.10)."""
-    client = anthropic.Anthropic(api_key=api_key)
-    tickers_str = ", ".join(f"{t} ({v['name']})" for t, v in etfs.items())
-    # Prompt asks for a single broad search rather than per-ETF queries to stay within max_uses=5
-    user_msg = {
-        "role": "user",
-        "content": f"""Search the web for recent news and market sentiment for these UK ETFs: {tickers_str}.
-Do at most 5 searches total — batch by theme (e.g. global equities, emerging markets, defence/thematic).
-
-Then return ONLY a raw JSON object (no markdown, no preamble):
-{{
-  "TICKER": {{
-    "sentiment": "bullish" | "neutral" | "bearish",
-    "rating": "buy" | "hold" | "sell",
-    "analyst_view": "brief analyst view or empty string",
-    "news": [
-      {{"text": "headline", "impact": "high" | "medium" | "low", "source": "Publication", "url": "https://url-or-empty"}}
-    ],
-    "drivers": "one sentence key driver"
-  }}
-}}
-Cover every ticker. Raw JSON only — your entire reply must be parseable JSON.""",
-    }
-    _tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}]
-    _model = "claude-haiku-4-5-20251001"
+    """Streamlit wrapper around core.fetch_news_and_ratings_raw with UI fallback."""
     try:
-        messages = [user_msg]
-        response = client.messages.create(
-            model=_model,
-            max_tokens=3000,
-            tools=_tools,
-            messages=messages,
-        )
-        # Handle pause_turn: server hit the search iteration limit, continue to get final text
-        while response.stop_reason == "pause_turn":
-            messages = messages + [{"role": "assistant", "content": response.content}]
-            response = client.messages.create(
-                model=_model,
-                max_tokens=3000,
-                tools=_tools,
-                messages=messages,
-            )
-        # Extract the final text block (skip web_search_result and tool_use blocks)
-        text = next((b.text for b in response.content if hasattr(b, "text") and b.text.strip()), "")
-        if not text:
-            raise ValueError("No text in response — model may still be in tool-use loop")
-        # Strip fences, then grab the outermost {...}
-        clean = text.replace("```json", "").replace("```", "").strip()
-        start = clean.index("{")
-        end = clean.rindex("}") + 1
-        return json.loads(clean[start:end])
+        return core.fetch_news_and_ratings_raw(etfs, api_key)
     except Exception as e:
         st.error(f"News fetch failed: {e}")
         return {t: {"sentiment": "neutral", "rating": "hold", "news": [], "drivers": ""} for t in etfs}
@@ -413,6 +330,112 @@ def generate_analysis(allocs, news, price_data, etfs):
             "Be specific. No bullets. No preamble."}],
     )
     return msg.content[0].text
+
+# =============================================================================
+# Signals + snapshot wiring
+# =============================================================================
+
+def build_signals_for_all(price_data, news_data):
+    """Run compute_signals + composite_score for every ETF. Returns {ticker: {flags, score}}."""
+    out = {}
+    for ticker, pd_ in price_data.items():
+        if not pd_:
+            out[ticker] = {"flags": sg._empty_signals(), "score": 50.0}
+            continue
+        flags = sg.compute_signals(
+            pd_.get("history"),
+            fundamentals=pd_,
+            volume_series=pd_.get("volume"),
+        )
+        rating = (news_data.get(ticker) or {}).get("rating", "hold")
+        out[ticker] = {"flags": flags, "score": sg.composite_score(rating, flags)}
+    return out
+
+
+def persist_snapshots(etfs, price_data, news_data, signals_data):
+    """Write one snapshot row per ticker for today. Silent on failure (DB is non-critical)."""
+    try:
+        for ticker in etfs:
+            pd_ = price_data.get(ticker) or {}
+            news = news_data.get(ticker) or {}
+            sig = signals_data.get(ticker) or {}
+            db.insert_snapshot(ticker, {
+                "price": pd_.get("current"),
+                "ret_1w": pd_.get("ret_1w"),
+                "ret_1m": pd_.get("ret_1m"),
+                "ret_3m": pd_.get("ret_3m"),
+                "drawdown": pd_.get("drawdown"),
+                "vol_30d": pd_.get("vol_30d"),
+                "beta": pd_.get("beta"),
+                "dividend_yield": pd_.get("dividend_yield"),
+                "rating": news.get("rating"),
+                "sentiment": news.get("sentiment"),
+                "score": sig.get("score"),
+                "signals": sig.get("flags"),
+            })
+    except Exception as e:
+        st.warning(f"Snapshot save failed (non-fatal): {e}")
+
+
+SIGNAL_ICONS = {
+    "golden_cross":    ("↑MA",   "#00C896", "#E8FAF4", "50d crossed above 200d"),
+    "death_cross":     ("↓MA",   "#EF4444", "#FEF2F2", "50d crossed below 200d"),
+    "macd_bull_cross": ("MACD↑", "#00C896", "#E8FAF4", "MACD bullish cross"),
+    "macd_bear_cross": ("MACD↓", "#EF4444", "#FEF2F2", "MACD bearish cross"),
+    "rsi_overbought":  ("RSI▲",  "#F59E0B", "#FEF3C7", "RSI > 70"),
+    "rsi_oversold":    ("RSI▼",  "#3B82F6", "#EFF6FF", "RSI < 30"),
+    "deep_drawdown":   ("DD",    "#EF4444", "#FEF2F2", "drawdown < −15%"),
+    "high_vol":        ("σ",     "#F59E0B", "#FEF3C7", "30d vol > 25%"),
+    "volume_spike":    ("⚡",    "#3B82F6", "#EFF6FF", "volume > 2× 90d avg"),
+    "near_52w_high":   ("52w↑",  "#00C896", "#E8FAF4", "within 3% of 52-week high"),
+    "momentum_1m_pos": ("1M+",   "#00C896", "#E8FAF4", "1-month return > 0"),
+}
+
+
+def render_signal_chips(flags):
+    """Render small flag chips for any active signal."""
+    on = [k for k in sg.SIGNAL_KEYS if flags.get(k)]
+    if not on:
+        return ""
+    chips = []
+    for k in on:
+        if k not in SIGNAL_ICONS: continue
+        label, fg, bg, tip = SIGNAL_ICONS[k]
+        chips.append(
+            f"<span title='{tip}' style='background:{bg};color:{fg};font-size:9px;font-weight:700;"
+            f"padding:2px 5px;border-radius:3px;letter-spacing:0.04em;margin-right:3px;"
+            f"display:inline-block;white-space:nowrap;'>{label}</span>"
+        )
+    return "".join(chips)
+
+
+def render_changes_strip(changes):
+    """Render the 'what changed since last refresh' strip; returns HTML or ''."""
+    if not changes:
+        return ""
+    sev_style = {
+        "up":      ("#00C896", "#E8FAF4"),
+        "down":    ("#EF4444", "#FEF2F2"),
+        "neutral": ("#F59E0B", "#FEF3C7"),
+    }
+    pills = []
+    for c in changes:
+        fg, bg = sev_style.get(c.get("severity", "neutral"))
+        pills.append(
+            f"<span style='background:{bg};color:{fg};font-size:11px;font-weight:600;"
+            f"padding:4px 8px;border-radius:6px;margin:0 6px 6px 0;display:inline-block;"
+            f"white-space:nowrap;font-family:Helvetica Neue,Helvetica,Arial,sans-serif;'>"
+            f"<span class='mono' style='font-weight:700;'>{c['ticker']}</span> · {c['detail']}</span>"
+        )
+    return (
+        "<div style='background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;"
+        "padding:12px 14px;margin-bottom:16px;'>"
+        "<div style='font-size:11px;font-weight:600;color:#64748B;text-transform:uppercase;"
+        "letter-spacing:0.08em;margin-bottom:8px;'>Changed since last refresh</div>"
+        + "".join(pills) +
+        "</div>"
+    )
+
 
 # =============================================================================
 # Helpers
@@ -537,6 +560,11 @@ with st.sidebar:
         with st.spinner("Fetching prices…"):
             etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
             st.session_state.price_data = fetch_price_data(etf_pairs)
+            st.session_state.signals_data = build_signals_for_all(
+                st.session_state.price_data, st.session_state.news_data)
+            persist_snapshots(st.session_state.etfs, st.session_state.price_data,
+                              st.session_state.news_data, st.session_state.signals_data)
+            st.session_state.changes = db.diff_vs_previous()
         st.toast("Prices refreshed ✓", icon="✅")
 
     if st.button("📰 Refresh news", use_container_width=True):
@@ -551,6 +579,11 @@ with st.sidebar:
                     st.session_state.news_data = fetch_news_and_ratings(st.session_state.etfs)
                     st.session_state.last_news_fetch = datetime.now()
                     st.session_state.api_spend += API_COST_PER_NEWS
+                    st.session_state.signals_data = build_signals_for_all(
+                        st.session_state.price_data, st.session_state.news_data)
+                    persist_snapshots(st.session_state.etfs, st.session_state.price_data,
+                                      st.session_state.news_data, st.session_state.signals_data)
+                    st.session_state.changes = db.diff_vs_previous()
                     st.toast("News refreshed ✓", icon="✅")
                 except Exception as e:
                     st.error(f"News fetch failed: {e}")
@@ -588,6 +621,15 @@ if not st.session_state.price_data:
     with st.spinner("Fetching prices…"):
         etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
         st.session_state.price_data = fetch_price_data(etf_pairs)
+        st.session_state.signals_data = build_signals_for_all(
+            st.session_state.price_data, st.session_state.news_data)
+        persist_snapshots(st.session_state.etfs, st.session_state.price_data,
+                          st.session_state.news_data, st.session_state.signals_data)
+        st.session_state.changes = db.diff_vs_previous()
+elif not st.session_state.signals_data:
+    # Price data exists but signals haven't been computed yet (e.g. after rerun)
+    st.session_state.signals_data = build_signals_for_all(
+        st.session_state.price_data, st.session_state.news_data)
 
 # =============================================================================
 # Top metrics row
@@ -617,8 +659,16 @@ tab_pos, tab_perf, tab_news, tab_analysis = st.tabs(
 
 # ----------------------------------------------------------------------------- Positions
 with tab_pos:
+    # "What changed since last refresh" strip
+    changes_html = render_changes_strip(st.session_state.changes)
+    if changes_html:
+        st.markdown(changes_html, unsafe_allow_html=True)
+
     core_etfs = {t: v for t, v in st.session_state.etfs.items() if v["cat"] == "Core"}
     sat_etfs = {t: v for t, v in st.session_state.etfs.items() if v["cat"] == "Satellite"}
+
+    def _score_for(ticker):
+        return (st.session_state.signals_data.get(ticker) or {}).get("score", 50.0)
 
     def render_etf_card(ticker):
         info = st.session_state.etfs[ticker]
@@ -626,17 +676,29 @@ with tab_pos:
         rating = rating_data.get("rating", "hold")
         price_data = st.session_state.price_data.get(ticker)
         n_items = rating_data.get("news", [])
+        sig = st.session_state.signals_data.get(ticker) or {}
+        flags = sig.get("flags", {})
+        score = sig.get("score", 50.0)
 
         with st.container(border=True):
             top1, top2 = st.columns([3, 1])
             with top1:
                 st.markdown(
-                    f"<div style='font-family:JetBrains Mono,monospace;font-size:16px;font-weight:600;letter-spacing:-0.01em;'>{ticker}</div>"
+                    f"<div style='font-family:JetBrains Mono,monospace;font-size:16px;font-weight:600;letter-spacing:-0.01em;'>{ticker} "
+                    f"<span style='font-size:10px;font-weight:500;color:#64748B;margin-left:4px;'>score {score:.0f}</span></div>"
                     f"<div style='font-size:12px;color:#64748B;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{info['name']}</div>",
                     unsafe_allow_html=True,
                 )
             with top2:
                 st.markdown(rating_html(rating), unsafe_allow_html=True)
+
+            # signal chips row (hidden if no active signals)
+            chips_html = render_signal_chips(flags)
+            if chips_html:
+                st.markdown(
+                    f"<div style='margin:6px 0 2px 0;line-height:1.6;'>{chips_html}</div>",
+                    unsafe_allow_html=True,
+                )
 
             mid1, mid2 = st.columns(2)
             with mid1:
@@ -698,7 +760,7 @@ with tab_pos:
     head_c1.caption(f"Core · {core_pct:.0f}%")
     head_c2.markdown("<div style='text-align:right;color:#64748B;font-size:12px;padding-top:2px;'>broad-market beta</div>", unsafe_allow_html=True)
 
-    core_list = list(core_etfs.keys())
+    core_list = sorted(core_etfs.keys(), key=_score_for, reverse=True)
     for row_start in range(0, len(core_list), 4):
         cols = st.columns(4)
         for col, ticker in zip(cols, core_list[row_start:row_start + 4]):
@@ -711,7 +773,7 @@ with tab_pos:
     head_s1.caption(f"Satellite · {sat_pct:.0f}%")
     head_s2.markdown("<div style='text-align:right;color:#64748B;font-size:12px;padding-top:2px;'>thematic overlay</div>", unsafe_allow_html=True)
 
-    sat_list = list(sat_etfs.keys())
+    sat_list = sorted(sat_etfs.keys(), key=_score_for, reverse=True)
     for row_start in range(0, len(sat_list), 4):
         cols = st.columns(4)
         for col, ticker in zip(cols, sat_list[row_start:row_start + 4]):
@@ -756,6 +818,102 @@ with tab_perf:
     fig.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
     fig.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+
+    # ---------- Risk / return scatter
+    st.caption("Risk vs return · 3-month return × 30-day volatility")
+    scatter_rows = []
+    for t, info in st.session_state.etfs.items():
+        pd_ = st.session_state.price_data.get(t)
+        if not pd_: continue
+        scatter_rows.append({
+            "ticker": t,
+            "ret_3m": pd_.get("ret_3m") or 0.0,
+            "vol_30d": pd_.get("vol_30d") or 0.0,
+            "allocation": st.session_state.allocs.get(t, 0.0),
+            "rating": (st.session_state.news_data.get(t) or {}).get("rating", "hold").upper(),
+        })
+    if scatter_rows:
+        sdf = pd.DataFrame(scatter_rows)
+        rating_colors = {"BUY": "#00C896", "HOLD": "#F59E0B", "SELL": "#EF4444"}
+        fig2 = px.scatter(
+            sdf, x="ret_3m", y="vol_30d", size="allocation", color="rating",
+            text="ticker", color_discrete_map=rating_colors,
+            size_max=44, hover_data={"allocation": ":.1f"},
+        )
+        fig2.update_traces(textposition="top center", textfont=dict(size=10, color="#0F172A"))
+        fig2.add_vline(x=0, line_dash="dash", line_color="#94A3B8", line_width=1)
+        fig2.update_layout(
+            height=420, margin=dict(l=40, r=20, t=20, b=40),
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=11), title=None),
+            xaxis_title="3-month return (%)", yaxis_title="30-day volatility (%)",
+        )
+        fig2.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+        fig2.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+        st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+
+    # ---------- Correlation heatmap (90-day daily returns)
+    st.caption("Correlation · 90-day daily returns")
+    ret_frames = {}
+    for t in st.session_state.etfs:
+        pd_ = st.session_state.price_data.get(t)
+        if pd_ and not pd_.get("history", pd.DataFrame()).empty:
+            h = pd_["history"].copy()
+            h = h.set_index("date")["price"].astype(float)
+            ret_frames[t] = h.pct_change().dropna().tail(90)
+    if len(ret_frames) >= 2:
+        corr_df = pd.DataFrame(ret_frames).corr()
+        fig3 = px.imshow(
+            corr_df, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+            aspect="auto", text_auto=".2f",
+        )
+        fig3.update_layout(
+            height=460, margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Helvetica Neue", size=11, color="#0F172A"),
+            coloraxis_colorbar=dict(thickness=12, len=0.6),
+        )
+        fig3.update_xaxes(side="bottom", tickfont=dict(color="#64748B", size=10))
+        fig3.update_yaxes(tickfont=dict(color="#64748B", size=10))
+        st.plotly_chart(fig3, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+
+    # ---------- Drawdown over time
+    st.caption("Drawdown from running peak · %")
+    fig4 = go.Figure()
+    plotted = 0
+    for i, t in enumerate(picks):
+        pd_ = st.session_state.price_data.get(t)
+        if not pd_ or pd_.get("history", pd.DataFrame()).empty: continue
+        h = pd_["history"].copy().sort_values("date")
+        price = h["price"].astype(float)
+        peak = price.cummax()
+        dd = (price / peak - 1) * 100
+        fig4.add_trace(go.Scatter(
+            x=h["date"], y=dd, mode="lines", name=t,
+            line=dict(color=line_palette[i % len(line_palette)], width=1.6),
+            hovertemplate=f"<b>{t}</b><br>%{{x|%d %b}}<br>%{{y:.2f}}%<extra></extra>",
+        ))
+        plotted += 1
+    if plotted:
+        fig4.add_hline(y=0, line_dash="dash", line_color="#94A3B8", line_width=1)
+        fig4.update_layout(
+            height=340, margin=dict(l=40, r=20, t=20, b=40),
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=11)),
+            hovermode="x unified",
+        )
+        fig4.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+        fig4.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11),
+                          ticksuffix="%", zeroline=False)
+        st.plotly_chart(fig4, use_container_width=True, config={"displayModeBar": False})
 
 # ----------------------------------------------------------------------------- News & signals
 with tab_news:

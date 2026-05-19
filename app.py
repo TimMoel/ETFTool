@@ -292,10 +292,14 @@ def fetch_price_data(etf_pairs):
     return results
 
 def fetch_news_and_ratings(etfs):
-    """Fetch news and ratings from Claude API. Preserved from original."""
+    """Fetch news and ratings using Claude with live web search."""
     client = anthropic.Anthropic(api_key=api_key)
-    tickers_str = ", ".join(f"{t} ({v['name']})" for t,v in etfs.items())
-    prompt = f"""Search for the most recent news (last 2 weeks) for these LSE-listed ETFs: {tickers_str}.
+    tickers_str = ", ".join(f"{t} ({v['name']})" for t, v in etfs.items())
+    user_msg = {
+        "role": "user",
+        "content": f"""Search the web for the most recent news (last 2 weeks) for these LSE-listed ETFs: {tickers_str}.
+
+Use web search to find current headlines, analyst commentary, and market developments for each ETF.
 
 Return ONLY a raw JSON object. No markdown. Structure:
 {{
@@ -310,19 +314,32 @@ Return ONLY a raw JSON object. No markdown. Structure:
     "drivers": "one sentence key driver"
   }}
 }}
-Include all tickers. For each news item include the source publication name and the direct article URL if available. Raw JSON only."""
+Include all tickers. For each news item include the source publication name and the direct article URL if available. Raw JSON only.""",
+    }
     try:
-        msg = client.messages.create(
+        messages = [user_msg]
+        response = client.messages.create(
             model="claude-opus-4-7",
-            max_tokens=4000,
-            messages=[{"role":"user","content":prompt}],
+            max_tokens=6000,
+            tools=[{"type": "web_search_20260209", "name": "web_search"}],
+            messages=messages,
         )
-        text = msg.content[0].text
-        clean = text.replace("```json","").replace("```","").strip()
-        json_str = clean[clean.index("{"):clean.rindex("}")+1]
+        # Handle pause_turn: server hit iteration limit, re-send to continue
+        while response.stop_reason == "pause_turn":
+            messages = messages + [{"role": "assistant", "content": response.content}]
+            response = client.messages.create(
+                model="claude-opus-4-7",
+                max_tokens=6000,
+                tools=[{"type": "web_search_20260209", "name": "web_search"}],
+                messages=messages,
+            )
+        # Extract the final text block
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        clean = text.replace("```json", "").replace("```", "").strip()
+        json_str = clean[clean.index("{"):clean.rindex("}") + 1]
         return json.loads(json_str)
     except Exception as e:
-        st.error(f"API error: {e}")
+        st.error(f"News fetch failed: {e}")
         return {t: {"sentiment": "neutral", "rating": "hold", "news": [], "drivers": ""} for t in etfs}
 
 def generate_analysis(allocs, news, price_data, etfs):

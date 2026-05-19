@@ -285,7 +285,6 @@ if "signals_data"    not in st.session_state: st.session_state.signals_data = {}
 if "changes"         not in st.session_state: st.session_state.changes = []
 if "last_news_fetch" not in st.session_state: st.session_state.last_news_fetch = None
 if "api_spend"       not in st.session_state: st.session_state.api_spend = 0.0
-if "portfolio_value" not in st.session_state: st.session_state.portfolio_value = 248412.0
 
 # Make sure the snapshot DB schema exists on first run.
 db.init_db()
@@ -501,6 +500,54 @@ def fmt_signed_pct(v, digits=2):
     return ("+" + s if v > 0 else s) + "%"
 
 
+def _render_etf_edit_popover(ticker, info):
+    """Inline popover UI for changing an ETF's category and re-verifying its Yahoo symbol."""
+    st.caption("Category")
+    new_cat = st.radio(
+        "Category", ["Core", "Satellite"],
+        index=0 if info["cat"] == "Core" else 1,
+        horizontal=True, label_visibility="collapsed",
+        key=f"cat_{ticker}",
+    )
+    if new_cat != info["cat"]:
+        st.session_state.etfs[ticker]["cat"] = new_cat
+        st.rerun()
+
+    st.caption("Yahoo symbol")
+    st.markdown(
+        f"<span class='mono' style='font-size:12px;'>"
+        f"Currently <b>{info['yahoo']}</b></span>",
+        unsafe_allow_html=True,
+    )
+    q = st.text_input(
+        "Re-verify ticker", value=ticker,
+        label_visibility="collapsed",
+        key=f"verify_q_{ticker}",
+    )
+    if q and len(q.strip()) >= 2:
+        with st.spinner("Searching…"):
+            results = search_tickers(q.strip())
+        if results:
+            idx = st.selectbox(
+                "Match", options=range(len(results)),
+                format_func=lambda i: (
+                    f"{results[i]['symbol']} — {results[i]['name']}"
+                    + (f" ({results[i]['exchange']})" if results[i].get("exchange") else "")
+                ),
+                label_visibility="collapsed",
+                key=f"verify_sel_{ticker}",
+            )
+            sel = results[idx]
+            if st.button("Save changes", key=f"verify_save_{ticker}", use_container_width=True):
+                st.session_state.etfs[ticker]["yahoo"] = sel["symbol"]
+                st.session_state.etfs[ticker]["name"] = sel["name"]
+                st.session_state.price_data.pop(ticker, None)
+                st.session_state.signals_data.pop(ticker, None)
+                st.rerun()
+        else:
+            st.warning("No results.")
+
+
 @st.cache_data(ttl=300)
 def search_tickers(query: str):
     """Search Yahoo Finance for tickers/names. Returns list of dicts with symbol/name/exchange/type."""
@@ -528,15 +575,6 @@ with st.sidebar:
     st.markdown("## Portfolio")
     st.caption(f"{len(st.session_state.etfs)} ETFs · GBP")
 
-    # ---- portfolio value
-    st.caption("Portfolio value")
-    st.session_state.portfolio_value = st.number_input(
-        "Portfolio value (£)",
-        min_value=0.0, step=1000.0,
-        value=st.session_state.portfolio_value,
-        label_visibility="collapsed",
-    )
-
     # ---- allocations
     st.caption("Allocation")
     total = sum(st.session_state.allocs.values())
@@ -547,7 +585,6 @@ with st.sidebar:
         f"</div>",
         unsafe_allow_html=True,
     )
-    st.progress(min(total, 100) / 100.0)
 
     # group by category for sleeker editing
     _core_tickers = [t for t, v in st.session_state.etfs.items() if v["cat"] == "Core"]
@@ -616,11 +653,20 @@ with st.sidebar:
             else:
                 st.warning("No results — try a different term.")
 
-        st.caption("Remove")
+        st.caption("Your ETFs")
         for ticker in list(st.session_state.etfs.keys()):
-            rc1, rc2 = st.columns([3, 1])
-            rc1.markdown(f"<span class='mono' style='font-size:12px;'>{ticker}</span>", unsafe_allow_html=True)
-            if rc2.button("✕", key=f"rm_{ticker}", help=f"Remove {ticker}"):
+            _info = st.session_state.etfs[ticker]
+            rc1, rc2, rc3 = st.columns([1.3, 1.4, 0.5])
+            rc1.markdown(
+                f"<div style='padding-top:8px;'>"
+                f"<span class='mono' style='font-size:12px;font-weight:600;'>{ticker}</span>"
+                f"<span style='font-size:10px;color:#94A3B8;margin-left:6px;'>{_info['cat'][:3].upper()}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            with rc2.popover("Edit", use_container_width=True):
+                _render_etf_edit_popover(ticker, _info)
+            if rc3.button("✕", key=f"rm_{ticker}", help=f"Remove {ticker}"):
                 del st.session_state.etfs[ticker]
                 st.session_state.allocs.pop(ticker, None)
                 st.rerun()
@@ -682,12 +728,6 @@ with st.sidebar:
 # =============================================================================
 
 st.markdown("# ETF Tracker")
-st.markdown(
-    f"<div style='color:#64748B;font-size:13px;margin-bottom:24px;'>"
-    f"Portfolio sentiment dashboard · {len(st.session_state.etfs)} positions"
-    f"</div>",
-    unsafe_allow_html=True,
-)
 
 # =============================================================================
 # Auto-fetch prices on first load
@@ -708,22 +748,28 @@ elif not st.session_state.signals_data:
         st.session_state.price_data, st.session_state.news_data)
 
 # =============================================================================
-# Top metrics row
+# Header stat strip — live weighted returns + position count
 # =============================================================================
 
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    pv = st.session_state.portfolio_value
-    st.metric("Portfolio value", f"£{pv:,.0f}")
-with m2:
-    st.metric("Month to date", "+3.42%", "vs benchmark")
-with m3:
-    buy_n = sum(1 for v in st.session_state.news_data.values() if v.get("rating","").lower() == "buy")
-    hold_n = sum(1 for v in st.session_state.news_data.values() if v.get("rating","").lower() == "hold")
-    sell_n = sum(1 for v in st.session_state.news_data.values() if v.get("rating","").lower() == "sell")
-    st.metric("Signals", f"{buy_n}B · {hold_n}H · {sell_n}S", "from Claude")
-with m4:
-    st.metric("Portfolio status", "On track", "balanced")
+weighted_1m = sum(
+    (st.session_state.allocs.get(t, 0) / 100.0) * (pd_.get("ret_1m") or 0)
+    for t, pd_ in st.session_state.price_data.items() if pd_
+)
+weighted_3m = sum(
+    (st.session_state.allocs.get(t, 0) / 100.0) * (pd_.get("ret_3m") or 0)
+    for t, pd_ in st.session_state.price_data.items() if pd_
+)
+n_positions = len(st.session_state.etfs)
+st.markdown(
+    f"<div style='color:#64748B;font-size:13px;margin-bottom:24px;'>"
+    f"{n_positions} positions"
+    f" · <span class='mono' style='color:{pct_color(weighted_1m)};font-weight:600;'>"
+    f"1M {fmt_signed_pct(weighted_1m, 1)}</span>"
+    f" · <span class='mono' style='color:{pct_color(weighted_3m)};font-weight:600;'>"
+    f"3M {fmt_signed_pct(weighted_3m, 1)}</span>"
+    f"</div>",
+    unsafe_allow_html=True,
+)
 
 # =============================================================================
 # Tabs

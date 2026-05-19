@@ -306,7 +306,7 @@ Return ONLY a raw JSON object. No markdown. Structure:
 Include all tickers. Raw JSON only."""
     try:
         msg = client.messages.create(
-            model="claude-opus-4.7",
+            model="claude-opus-4-7",
             max_tokens=4000,
             messages=[{"role":"user","content":prompt}],
         )
@@ -327,7 +327,7 @@ def generate_analysis(allocs, news, price_data, etfs):
     buy_list   = [t for t,v in news.items() if v.get("rating")=="buy"]
     high_news  = [(t,i["text"]) for t,v in news.items() for i in v.get("news",[]) if isinstance(i,dict) and i.get("impact")=="high"]
     msg = client.messages.create(
-        model="claude-opus-4.7",
+        model="claude-opus-4-7",
         max_tokens=1500,
         messages=[{"role":"user","content":
             f"Portfolio analyst. Allocation: {alloc_str}\nPrice: {price_str}\n"

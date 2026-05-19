@@ -304,15 +304,19 @@ Return ONLY a raw JSON object. No markdown. Structure:
   }}
 }}
 Include all tickers. Raw JSON only."""
-    with client.messages.stream(
-        model="claude-opus-4-5-20251101", max_tokens=4000,
-        tools=[{{"type":"web_search_20250305","name":"web_search"}}],
-        messages=[{{"role":"user","content":prompt}}],
-        betas=["web-search-2025-03-05"],
-    ) as stream:
-        text = stream.get_final_text()
-    clean = text.replace("```json","").replace("```","").strip()
-    return json.loads(clean[clean.index("{"):clean.rindex("}")+1])
+    try:
+        msg = client.messages.create(
+            model="claude-opus-4.7",
+            max_tokens=4000,
+            messages=[{"role":"user","content":prompt}],
+        )
+        text = msg.content[0].text
+        clean = text.replace("```json","").replace("```","").strip()
+        json_str = clean[clean.index("{"):clean.rindex("}")+1]
+        return json.loads(json_str)
+    except Exception as e:
+        st.error(f"API error: {e}")
+        return {t: {"sentiment": "neutral", "rating": "hold", "news": [], "drivers": ""} for t in etfs}
 
 def generate_analysis(allocs, news, price_data, etfs):
     """Generate Claude portfolio analysis. Preserved from original."""
@@ -323,7 +327,8 @@ def generate_analysis(allocs, news, price_data, etfs):
     buy_list   = [t for t,v in news.items() if v.get("rating")=="buy"]
     high_news  = [(t,i["text"]) for t,v in news.items() for i in v.get("news",[]) if isinstance(i,dict) and i.get("impact")=="high"]
     msg = client.messages.create(
-        model="claude-opus-4-5-20251101", max_tokens=1500,
+        model="claude-opus-4.7",
+        max_tokens=1500,
         messages=[{"role":"user","content":
             f"Portfolio analyst. Allocation: {alloc_str}\nPrice: {price_str}\n"
             f"Buy signals: {buy_list}\nSell signals: {sell_list}\nHigh-impact news: {high_news}\n"
@@ -376,15 +381,26 @@ with st.sidebar:
         )
     st.progress(min(total, 100) / 100.0)
 
-    # editable sliders
+    # editable sliders + numeric input
     for ticker, info in st.session_state.etfs.items():
-        new_val = st.slider(
-            ticker,
-            min_value=0.0, max_value=60.0, step=0.5,
-            value=float(st.session_state.allocs.get(ticker, 0.0)),
-            key=f"slider_{ticker}",
-            label_visibility="visible",
-        )
+        col_slider, col_input = st.columns([3, 1])
+        with col_slider:
+            new_val = st.slider(
+                ticker,
+                min_value=0.0, max_value=60.0, step=0.5,
+                value=float(st.session_state.allocs.get(ticker, 0.0)),
+                key=f"slider_{ticker}",
+                label_visibility="visible",
+            )
+        with col_input:
+            num_val = st.number_input(
+                f"alloc_{ticker}",
+                min_value=0.0, max_value=60.0, step=0.5,
+                value=float(st.session_state.allocs.get(ticker, 0.0)),
+                key=f"num_{ticker}",
+                label_visibility="collapsed",
+            )
+            new_val = num_val if num_val != float(st.session_state.allocs.get(ticker, 0.0)) else new_val
         st.session_state.allocs[ticker] = new_val
 
     st.divider()
@@ -425,15 +441,19 @@ with st.sidebar:
     st.divider()
 
     # ---- action buttons
+    st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
+
     force = st.toggle("Force refresh (override throttle)", value=False, key="force_refresh")
 
-    if st.button("↻  Refresh prices", use_container_width=True):
+    st.markdown("<div style='margin-bottom:8px;'></div>", unsafe_allow_html=True)
+
+    if st.button("↻ Refresh prices", use_container_width=True):
         with st.spinner("Fetching prices…"):
             etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
             st.session_state.price_data = fetch_price_data(etf_pairs)
         st.toast("Prices refreshed ✓", icon="✅")
 
-    if st.button("📰  Refresh news", use_container_width=True):
+    if st.button("📰 Refresh news", use_container_width=True):
         hrs = hours_since_last_fetch()
         can_refresh = force or (hrs is None or hrs >= API_MIN_REFRESH_HRS)
         if not can_refresh:
@@ -449,7 +469,7 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"News fetch failed: {e}")
 
-    if st.button("✨  Analyse portfolio", type="primary", use_container_width=True):
+    if st.button("✨ Analyse portfolio", type="primary", use_container_width=True):
         with st.spinner("Generating analysis…"):
             try:
                 st.session_state.analysis = generate_analysis(
@@ -459,6 +479,8 @@ with st.sidebar:
                 st.toast("Analysis generated ✓", icon="✨")
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
+
+    st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
 
 # =============================================================================
 # Header

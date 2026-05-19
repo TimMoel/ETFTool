@@ -90,14 +90,13 @@ def fetch_news_and_ratings_raw(etfs, api_key):
         "role": "user",
         "content": (
             f"Search the web for recent news and market sentiment for these UK ETFs: {tickers_str}.\n"
-            "Do at most 5 searches total — batch by theme (e.g. global equities, "
+            "Do at most 3 searches total — batch by theme (e.g. global equities, "
             "emerging markets, defence/thematic).\n\n"
             "Then return ONLY a raw JSON object (no markdown, no preamble):\n"
             "{\n"
             '  "TICKER": {\n'
             '    "sentiment": "bullish" | "neutral" | "bearish",\n'
             '    "rating": "buy" | "hold" | "sell",\n'
-            '    "analyst_view": "brief analyst view or empty string",\n'
             '    "news": [\n'
             '      {"text": "headline", "impact": "high" | "medium" | "low", '
             '"source": "Publication", "url": "https://url-or-empty"}\n'
@@ -105,23 +104,34 @@ def fetch_news_and_ratings_raw(etfs, api_key):
             '    "drivers": "one sentence key driver"\n'
             "  }\n"
             "}\n"
-            "Cover every ticker. Raw JSON only — your entire reply must be parseable JSON."
+            "Cover every ticker. Up to 3 news items per ticker (most important only). "
+            "Raw JSON only — your entire reply must be parseable JSON."
         ),
     }
     tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}]
     model = "claude-sonnet-4-6"
     messages = [user_msg]
-    response = client.messages.create(model=model, max_tokens=2000,
+    response = client.messages.create(model=model, max_tokens=3500,
                                       tools=tools, messages=messages)
     while response.stop_reason == "pause_turn":
         messages = messages + [{"role": "assistant", "content": response.content}]
-        response = client.messages.create(model=model, max_tokens=2000,
+        response = client.messages.create(model=model, max_tokens=3500,
                                           tools=tools, messages=messages)
     text = next((b.text for b in response.content
                  if hasattr(b, "text") and b.text.strip()), "")
     if not text:
-        raise ValueError("No text block in Claude response")
+        raise ValueError(
+            f"Claude returned no text block (stop_reason={response.stop_reason}). "
+            "Likely all tokens consumed by tool use — raise max_tokens."
+        )
     clean = text.replace("```json", "").replace("```", "").strip()
-    start = clean.index("{")
-    end = clean.rindex("}") + 1
-    return json.loads(clean[start:end])
+    try:
+        start = clean.index("{")
+        end = clean.rindex("}") + 1
+        return json.loads(clean[start:end])
+    except (ValueError, json.JSONDecodeError) as e:
+        snippet = clean[:200] + ("…" if len(clean) > 200 else "")
+        raise ValueError(
+            f"News JSON parse failed ({type(e).__name__}: {e}). "
+            f"Response start: {snippet!r}"
+        ) from e

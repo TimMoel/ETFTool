@@ -203,6 +203,32 @@ st.markdown(
         padding: 14px !important;
     }
     [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.25rem; }
+
+    /* --- sleek sidebar allocation inputs ------------------------------- */
+    [data-testid="stSidebar"] [data-testid="stNumberInput"] label {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        font-size: 12px !important;
+        font-weight: 600 !important;
+        color: #0F172A !important;
+        text-transform: none !important;
+        letter-spacing: 0 !important;
+        margin-bottom: 0 !important;
+        padding-bottom: 0 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stNumberInput"] input {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        text-align: right;
+        font-size: 13px;
+        padding: 4px 8px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stNumberInput"] {
+        margin-bottom: 2px;
+    }
+    /* breathing space above each sidebar section caption */
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+        margin-top: 14px;
+        margin-bottom: 4px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -511,49 +537,47 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    st.divider()
-
     # ---- allocations
-    st.caption("Allocations")
+    st.caption("Allocation")
     total = sum(st.session_state.allocs.values())
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        st.markdown(f"<span class='mono' style='font-size:13px;'>Total</span>", unsafe_allow_html=True)
-    with col_b:
-        color = "#0F172A" if abs(total - 100) < 0.01 else "#F59E0B"
-        st.markdown(
-            f"<div class='mono' style='text-align:right;font-weight:600;color:{color};'>{total:.1f}% <span style='color:#94A3B8;font-weight:400;'>/ 100%</span></div>",
-            unsafe_allow_html=True,
-        )
+    total_color = "#0F172A" if abs(total - 100) < 0.01 else "#F59E0B"
+    st.markdown(
+        f"<div class='mono' style='font-size:15px;font-weight:600;color:{total_color};'>"
+        f"{total:.1f}% <span style='color:#94A3B8;font-weight:400;font-size:13px;'>/ 100%</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
     st.progress(min(total, 100) / 100.0)
 
-    # editable sliders + numeric input
-    for ticker, info in st.session_state.etfs.items():
-        col_slider, col_input = st.columns([3, 1])
-        with col_slider:
-            new_val = st.slider(
+    # group by category for sleeker editing
+    _core_tickers = [t for t, v in st.session_state.etfs.items() if v["cat"] == "Core"]
+    _sat_tickers  = [t for t, v in st.session_state.etfs.items() if v["cat"] == "Satellite"]
+    _core_pct = sum(st.session_state.allocs.get(t, 0) for t in _core_tickers)
+    _sat_pct  = sum(st.session_state.allocs.get(t, 0) for t in _sat_tickers)
+
+    if _core_tickers:
+        st.caption(f"Core · {_core_pct:.0f}%")
+        for ticker in _core_tickers:
+            st.session_state.allocs[ticker] = st.number_input(
                 ticker,
                 min_value=0.0, max_value=60.0, step=0.5,
                 value=float(st.session_state.allocs.get(ticker, 0.0)),
-                key=f"slider_{ticker}",
-                label_visibility="visible",
+                key=f"alloc_{ticker}",
             )
-        with col_input:
-            num_val = st.number_input(
-                f"alloc_{ticker}",
+
+    if _sat_tickers:
+        st.caption(f"Satellite · {_sat_pct:.0f}%")
+        for ticker in _sat_tickers:
+            st.session_state.allocs[ticker] = st.number_input(
+                ticker,
                 min_value=0.0, max_value=60.0, step=0.5,
                 value=float(st.session_state.allocs.get(ticker, 0.0)),
-                key=f"num_{ticker}",
-                label_visibility="collapsed",
+                key=f"alloc_{ticker}",
             )
-            new_val = num_val if num_val != float(st.session_state.allocs.get(ticker, 0.0)) else new_val
-        st.session_state.allocs[ticker] = new_val
-
-    st.divider()
 
     # ---- universe (add / remove)
     st.caption("Universe")
-    with st.expander("Add / Remove ETF", expanded=False):
+    with st.expander("Manage ETFs", expanded=False):
         search_query = st.text_input(
             "Search ticker or name",
             placeholder="e.g. VWRP, Vanguard, iShares",
@@ -601,24 +625,14 @@ with st.sidebar:
                 st.session_state.allocs.pop(ticker, None)
                 st.rerun()
 
-    st.divider()
-
-    # ---- api credits
-    st.caption("API credits")
+    # ---- usage + actions
     hrs = hours_since_last_fetch()
     next_refresh = max(0, API_MIN_REFRESH_HRS - (int(hrs) if hrs else 0))
-    st.caption(
-        f"${st.session_state.api_spend:.3f} used · refresh in {next_refresh}h"
-    )
+    st.caption(f"Usage · ${st.session_state.api_spend:.3f} today · next refresh {next_refresh}h")
 
     st.divider()
 
-    # ---- action buttons
-    st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
-
     force = st.toggle("Force refresh (override throttle)", value=False, key="force_refresh")
-
-    st.markdown("<div style='margin-bottom:8px;'></div>", unsafe_allow_html=True)
 
     if st.button("↻ Refresh prices", use_container_width=True):
         with st.spinner("Fetching prices…"):
@@ -662,8 +676,6 @@ with st.sidebar:
                 st.toast("Analysis generated ✓", icon="✨")
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
-
-    st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
 
 # =============================================================================
 # Header

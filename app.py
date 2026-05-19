@@ -196,6 +196,13 @@ st.markdown(
     /* hide the streamlit toolbar branding chrome we don't want */
     [data-testid="stToolbar"] { right: 1rem; }
     footer { visibility: hidden; }
+
+    /* --- additional breathing room for cards and layout ---------------- */
+    .main .block-container { padding-left: 2rem; padding-right: 2rem; }
+    [data-testid="stVerticalBlockBorderWrapper"] > div {
+        padding: 14px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.25rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -457,6 +464,26 @@ def fmt_signed_pct(v, digits=2):
     s = f"{v:.{digits}f}"
     return ("+" + s if v > 0 else s) + "%"
 
+
+@st.cache_data(ttl=300)
+def search_tickers(query: str):
+    """Search Yahoo Finance for tickers/names. Returns list of dicts with symbol/name/exchange/type."""
+    try:
+        results = yf.Search(query, max_results=8, enable_fuzzy_query=True, news_count=0)
+        return [
+            {
+                "symbol": q["symbol"],
+                "name": q.get("longname") or q.get("shortname", q["symbol"]),
+                "exchange": q.get("exchDisp", ""),
+                "type": q.get("quoteType", ""),
+            }
+            for q in results.quotes
+            if q.get("isYahooFinance", False)
+        ]
+    except Exception:
+        return []
+
+
 # =============================================================================
 # Sidebar
 # =============================================================================
@@ -517,16 +544,43 @@ with st.sidebar:
     # ---- universe (add / remove)
     st.caption("Universe")
     with st.expander("Add / Remove ETF", expanded=False):
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            new_ticker = st.text_input("Ticker", placeholder="e.g. IWDA", label_visibility="collapsed")
-        with c2:
-            if st.button("Add", use_container_width=True):
-                t = (new_ticker or "").strip().upper()
-                if t and t not in st.session_state.etfs:
-                    st.session_state.etfs[t] = {"name": t, "yahoo": f"{t}.L", "cat": "Satellite"}
-                    st.session_state.allocs[t] = 0.0
-                    st.rerun()
+        search_query = st.text_input(
+            "Search ticker or name",
+            placeholder="e.g. VWRP, Vanguard, iShares",
+            label_visibility="collapsed",
+            key="ticker_search_query",
+        )
+        if search_query and len(search_query.strip()) >= 2:
+            with st.spinner("Searching…"):
+                _results = search_tickers(search_query.strip())
+            if _results:
+                _selected_idx = st.selectbox(
+                    "Select",
+                    options=range(len(_results)),
+                    format_func=lambda i: (
+                        f"{_results[i]['symbol']} — {_results[i]['name']}"
+                        + (f" ({_results[i]['exchange']})" if _results[i].get("exchange") else "")
+                    ),
+                    label_visibility="collapsed",
+                    key="ticker_search_select",
+                )
+                _sel = _results[_selected_idx]
+                st.caption(f"{_sel['name']} · {_sel.get('exchange', '')} · {_sel.get('type', '').lower()}")
+                if st.button("Add to portfolio", use_container_width=True, key="ticker_add_btn"):
+                    _yahoo = _sel["symbol"]
+                    _base = _yahoo.split(".")[0]
+                    if _base not in st.session_state.etfs:
+                        st.session_state.etfs[_base] = {
+                            "name": _sel["name"],
+                            "yahoo": _yahoo,
+                            "cat": "Satellite",
+                        }
+                        st.session_state.allocs[_base] = 0.0
+                        st.rerun()
+                    else:
+                        st.warning(f"{_base} is already in your portfolio.")
+            else:
+                st.warning("No results — try a different term.")
 
         st.caption("Remove")
         for ticker in list(st.session_state.etfs.keys()):
@@ -684,21 +738,24 @@ with tab_pos:
             top1, top2 = st.columns([3, 1])
             with top1:
                 st.markdown(
-                    f"<div style='font-family:JetBrains Mono,monospace;font-size:16px;font-weight:600;letter-spacing:-0.01em;'>{ticker} "
-                    f"<span style='font-size:10px;font-weight:500;color:#64748B;margin-left:4px;'>score {score:.0f}</span></div>"
+                    f"<div style='font-family:JetBrains Mono,monospace;font-size:16px;font-weight:600;letter-spacing:-0.01em;'>{ticker}</div>"
                     f"<div style='font-size:12px;color:#64748B;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{info['name']}</div>",
                     unsafe_allow_html=True,
                 )
             with top2:
                 st.markdown(rating_html(rating), unsafe_allow_html=True)
 
-            # signal chips row (hidden if no active signals)
+            # score badge + signal chips row
             chips_html = render_signal_chips(flags)
-            if chips_html:
-                st.markdown(
-                    f"<div style='margin:6px 0 2px 0;line-height:1.6;'>{chips_html}</div>",
-                    unsafe_allow_html=True,
-                )
+            score_badge = (
+                f"<span style='background:#E2E8F0;color:#475569;font-size:9px;font-weight:700;"
+                f"padding:2px 5px;border-radius:3px;letter-spacing:0.04em;"
+                f"margin-right:3px;display:inline-block;'>Score {score:.0f}</span>"
+            )
+            st.markdown(
+                f"<div style='margin:6px 0 4px 0;line-height:1.8;'>{score_badge}{chips_html}</div>",
+                unsafe_allow_html=True,
+            )
 
             mid1, mid2 = st.columns(2)
             with mid1:
@@ -761,9 +818,9 @@ with tab_pos:
     head_c2.markdown("<div style='text-align:right;color:#64748B;font-size:12px;padding-top:2px;'>broad-market beta</div>", unsafe_allow_html=True)
 
     core_list = sorted(core_etfs.keys(), key=_score_for, reverse=True)
-    for row_start in range(0, len(core_list), 4):
-        cols = st.columns(4)
-        for col, ticker in zip(cols, core_list[row_start:row_start + 4]):
+    for row_start in range(0, len(core_list), 3):
+        cols = st.columns(3)
+        for col, ticker in zip(cols, core_list[row_start:row_start + 3]):
             with col:
                 render_etf_card(ticker)
 
@@ -774,9 +831,9 @@ with tab_pos:
     head_s2.markdown("<div style='text-align:right;color:#64748B;font-size:12px;padding-top:2px;'>thematic overlay</div>", unsafe_allow_html=True)
 
     sat_list = sorted(sat_etfs.keys(), key=_score_for, reverse=True)
-    for row_start in range(0, len(sat_list), 4):
-        cols = st.columns(4)
-        for col, ticker in zip(cols, sat_list[row_start:row_start + 4]):
+    for row_start in range(0, len(sat_list), 3):
+        cols = st.columns(3)
+        for col, ticker in zip(cols, sat_list[row_start:row_start + 3]):
             with col:
                 render_etf_card(ticker)
 

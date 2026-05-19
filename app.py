@@ -128,7 +128,7 @@ st.markdown(
     [data-testid="stSidebar"] .stButton button {
         width: 100%;
         background: #FFFFFF;
-        color: #0F172A;
+        color: #0F172A !important;
         border: 1px solid #CBD5E1;
         border-radius: 6px;
         padding: 9px 14px;
@@ -140,10 +140,15 @@ st.markdown(
         background: #F1F3F6;
         border-color: #0F172A;
     }
-    [data-testid="stSidebar"] .stButton button[kind="primary"] {
-        background: #0F172A;
-        color: #FFFFFF;
-        border-color: #0F172A;
+    [data-testid="stSidebar"] .stButton button[kind="primary"],
+    [data-testid="stSidebar"] .stButton button[data-testid="baseButton-primary"] {
+        background: #0F172A !important;
+        color: #FFFFFF !important;
+        border-color: #0F172A !important;
+    }
+    [data-testid="stSidebar"] .stButton button[kind="primary"] p,
+    [data-testid="stSidebar"] .stButton button[data-testid="baseButton-primary"] p {
+        color: #FFFFFF !important;
     }
 
     /* --- expander ------------------------------------------------------ */
@@ -239,6 +244,7 @@ if "analysis"        not in st.session_state: st.session_state.analysis = ""
 if "price_data"      not in st.session_state: st.session_state.price_data = {}
 if "last_news_fetch" not in st.session_state: st.session_state.last_news_fetch = None
 if "api_spend"       not in st.session_state: st.session_state.api_spend = 0.0
+if "portfolio_value" not in st.session_state: st.session_state.portfolio_value = 248412.0
 
 # =============================================================================
 # API key
@@ -366,6 +372,17 @@ def fmt_signed_pct(v, digits=2):
 with st.sidebar:
     st.markdown("## Portfolio")
     st.caption(f"{len(st.session_state.etfs)} ETFs · GBP")
+
+    # ---- portfolio value
+    st.caption("Portfolio value")
+    st.session_state.portfolio_value = st.number_input(
+        "Portfolio value (£)",
+        min_value=0.0, step=1000.0,
+        value=st.session_state.portfolio_value,
+        label_visibility="collapsed",
+    )
+
+    st.divider()
 
     # ---- allocations
     st.caption("Allocations")
@@ -500,7 +517,8 @@ st.markdown(
 
 m1, m2, m3, m4 = st.columns(4)
 with m1:
-    st.metric("Portfolio value", "£248,412", "+0.84%")
+    pv = st.session_state.portfolio_value
+    st.metric("Portfolio value", f"£{pv:,.0f}")
 with m2:
     st.metric("Month to date", "+3.42%", "vs benchmark")
 with m3:

@@ -177,6 +177,7 @@ st.markdown(
         font-size: 11px;
         font-weight: 700;
         letter-spacing: 0.08em;
+        white-space: nowrap;
         font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
     }
     .rating-buy  { color: #00C896; background: #E8FAF4; }
@@ -303,13 +304,13 @@ Return ONLY a raw JSON object. No markdown. Structure:
     "rating": "buy" | "hold" | "sell",
     "analyst_view": "analyst consensus or price target if available, else empty string",
     "news": [
-      {{"text": "headline or development", "impact": "high" | "medium" | "low"}},
-      {{"text": "second item", "impact": "medium"}}
+      {{"text": "headline or development", "impact": "high" | "medium" | "low", "source": "Publication name", "url": "https://full-article-url-or-empty-string"}},
+      {{"text": "second item", "impact": "medium", "source": "Publication name", "url": ""}}
     ],
     "drivers": "one sentence key driver"
   }}
 }}
-Include all tickers. Raw JSON only."""
+Include all tickers. For each news item include the source publication name and the direct article URL if available. Raw JSON only."""
     try:
         msg = client.messages.create(
             model="claude-opus-4-7",
@@ -512,6 +513,15 @@ st.markdown(
 )
 
 # =============================================================================
+# Auto-fetch prices on first load
+# =============================================================================
+
+if not st.session_state.price_data:
+    with st.spinner("Fetching prices…"):
+        etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
+        st.session_state.price_data = fetch_price_data(etf_pairs)
+
+# =============================================================================
 # Top metrics row
 # =============================================================================
 
@@ -596,12 +606,16 @@ with tab_pos:
                         if isinstance(n, dict):
                             impact = n.get("impact", "low").upper()
                             text = n.get("text", "")
+                            source = n.get("source", "")
+                            url = n.get("url", "")
                             impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
                             impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
+                            source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
                             st.markdown(
                                 f"<div style='padding:8px 0;border-bottom:1px solid #E5E7EB;'>"
                                 f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
                                 f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
+                                f"{source_html}"
                                 f"</div>"
                                 f"<div style='font-size:12px;line-height:1.4;color:#0F172A;'>{text}</div>"
                                 f"</div>",
@@ -692,10 +706,14 @@ with tab_news:
             for col, (t, n) in zip(cols, row):
                 with col:
                     with st.container(border=True):
+                        url = n.get("url", "")
+                        source = n.get("source", "")
+                        source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
                         st.markdown(
-                            f"<div style='margin-bottom:6px;'>"
+                            f"<div style='margin-bottom:6px;display:flex;align-items:center;gap:6px;'>"
                             f"<span style='background:#FEF2F2;color:#EF4444;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>HIGH</span>"
-                            f"<span class='mono' style='font-size:11px;font-weight:600;margin-left:6px;'>{t}</span>"
+                            f"<span class='mono' style='font-size:11px;font-weight:600;'>{t}</span>"
+                            f"{source_html}"
                             f"</div>"
                             f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{n.get('text', '')}</div>",
                             unsafe_allow_html=True,
@@ -714,12 +732,16 @@ with tab_news:
                 if isinstance(n, dict):
                     impact = n.get("impact", "low").upper()
                     text = n.get("text", "")
+                    source = n.get("source", "")
+                    url = n.get("url", "")
                     impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
                     impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
+                    source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
                     st.markdown(
                         f"<div style='padding:10px 0;border-bottom:1px solid #E5E7EB;'>"
                         f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
                         f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
+                        f"{source_html}"
                         f"</div>"
                         f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{text}</div>"
                         f"</div>",

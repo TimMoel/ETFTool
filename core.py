@@ -109,7 +109,7 @@ def fetch_news_and_ratings_raw(etfs, api_key):
         ),
     }
     tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}]
-    model = "claude-haiku-4-5-20251001"
+    model = "claude-sonnet-4-6"
     messages = [user_msg]
     response = client.messages.create(model=model, max_tokens=3000,
                                       tools=tools, messages=messages)

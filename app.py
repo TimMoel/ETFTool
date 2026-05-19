@@ -292,52 +292,57 @@ def fetch_price_data(etf_pairs):
     return results
 
 def fetch_news_and_ratings(etfs):
-    """Fetch news and ratings using Claude with live web search."""
+    """Fetch news and ratings using Haiku + web search (budget-capped at ~$0.10)."""
     client = anthropic.Anthropic(api_key=api_key)
     tickers_str = ", ".join(f"{t} ({v['name']})" for t, v in etfs.items())
+    # Prompt asks for a single broad search rather than per-ETF queries to stay within max_uses=5
     user_msg = {
         "role": "user",
-        "content": f"""Search the web for the most recent news (last 2 weeks) for these LSE-listed ETFs: {tickers_str}.
+        "content": f"""Search the web for recent news and market sentiment for these UK ETFs: {tickers_str}.
+Do at most 5 searches total — batch by theme (e.g. global equities, emerging markets, defence/thematic).
 
-Use web search to find current headlines, analyst commentary, and market developments for each ETF.
-
-Return ONLY a raw JSON object. No markdown. Structure:
+Then return ONLY a raw JSON object (no markdown, no preamble):
 {{
   "TICKER": {{
     "sentiment": "bullish" | "neutral" | "bearish",
     "rating": "buy" | "hold" | "sell",
-    "analyst_view": "analyst consensus or price target if available, else empty string",
+    "analyst_view": "brief analyst view or empty string",
     "news": [
-      {{"text": "headline or development", "impact": "high" | "medium" | "low", "source": "Publication name", "url": "https://full-article-url-or-empty-string"}},
-      {{"text": "second item", "impact": "medium", "source": "Publication name", "url": ""}}
+      {{"text": "headline", "impact": "high" | "medium" | "low", "source": "Publication", "url": "https://url-or-empty"}}
     ],
     "drivers": "one sentence key driver"
   }}
 }}
-Include all tickers. For each news item include the source publication name and the direct article URL if available. Raw JSON only.""",
+Cover every ticker. Raw JSON only — your entire reply must be parseable JSON.""",
     }
+    _tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}]
+    _model = "claude-haiku-4-5-20251001"
     try:
         messages = [user_msg]
         response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=6000,
-            tools=[{"type": "web_search_20260209", "name": "web_search"}],
+            model=_model,
+            max_tokens=3000,
+            tools=_tools,
             messages=messages,
         )
-        # Handle pause_turn: server hit iteration limit, re-send to continue
+        # Handle pause_turn: server hit the search iteration limit, continue to get final text
         while response.stop_reason == "pause_turn":
             messages = messages + [{"role": "assistant", "content": response.content}]
             response = client.messages.create(
-                model="claude-opus-4-7",
-                max_tokens=6000,
-                tools=[{"type": "web_search_20260209", "name": "web_search"}],
+                model=_model,
+                max_tokens=3000,
+                tools=_tools,
                 messages=messages,
             )
-        # Extract the final text block
-        text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        # Extract the final text block (skip web_search_result and tool_use blocks)
+        text = next((b.text for b in response.content if hasattr(b, "text") and b.text.strip()), "")
+        if not text:
+            raise ValueError("No text in response — model may still be in tool-use loop")
+        # Strip fences, then grab the outermost {...}
         clean = text.replace("```json", "").replace("```", "").strip()
-        json_str = clean[clean.index("{"):clean.rindex("}") + 1]
-        return json.loads(json_str)
+        start = clean.index("{")
+        end = clean.rindex("}") + 1
+        return json.loads(clean[start:end])
     except Exception as e:
         st.error(f"News fetch failed: {e}")
         return {t: {"sentiment": "neutral", "rating": "hold", "news": [], "drivers": ""} for t in etfs}

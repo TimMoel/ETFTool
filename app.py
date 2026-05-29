@@ -1175,6 +1175,147 @@ with tab_perf:
                           ticksuffix="%", zeroline=False)
         st.plotly_chart(fig4, use_container_width=True, config={"displayModeBar": False})
 
+    # ===================================================================
+    # Cost-basis-aware portfolio views
+    # ===================================================================
+    _held = [(t, position_pnl(t)) for t in st.session_state.etfs]
+    _held = [(t, p) for t, p in _held if p is not None]
+
+    if not _held:
+        st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
+        st.info(
+            "Enter average purchase price + units on at least one ETF "
+            "(via the **Manage ETFs** popover in the sidebar) to unlock "
+            "P/L ranking, allocation drift, and portfolio value over time."
+        )
+    else:
+        # ---------- P&L ranking bar chart
+        st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
+        st.caption("P/L ranking · winners and losers")
+        _pnl_rows = []
+        for t, (_value, _cost, _pnl_abs, _pnl_pct) in _held:
+            _pnl_rows.append({
+                "ticker": t,
+                "pnl_abs": _pnl_abs,
+                "pnl_pct": _pnl_pct,
+                "color": "#00C896" if _pnl_abs >= 0 else "#EF4444",
+            })
+        _pdf = pd.DataFrame(_pnl_rows).sort_values("pnl_abs", ascending=True)
+        fig_r = go.Figure(go.Bar(
+            x=_pdf["pnl_abs"], y=_pdf["ticker"],
+            orientation="h",
+            marker_color=_pdf["color"].tolist(),
+            text=[f"{fmt_money(v, 0)}  ({fmt_signed_pct(p, 1)})"
+                  for v, p in zip(_pdf["pnl_abs"], _pdf["pnl_pct"])],
+            textposition="outside",
+            textfont=dict(size=11, color="#0F172A"),
+            hovertemplate="<b>%{y}</b><br>P/L %{x:,.2f}<extra></extra>",
+        ))
+        fig_r.add_vline(x=0, line_color="#94A3B8", line_width=1)
+        fig_r.update_layout(
+            height=max(220, 36 * len(_pdf) + 80),
+            margin=dict(l=60, r=120, t=10, b=30),
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+            showlegend=False,
+        )
+        fig_r.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11),
+                           tickprefix="£", zeroline=False)
+        fig_r.update_yaxes(tickfont=dict(color="#0F172A", size=12,
+                                         family="JetBrains Mono, monospace"))
+        st.plotly_chart(fig_r, use_container_width=True, config={"displayModeBar": False})
+
+        # ---------- Allocation drift: target vs current value-weighted
+        st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+        st.caption("Allocation drift · target vs current value-weighted")
+        _total_value = sum(p[0] for _t, p in _held)
+        _drift_rows = []
+        for t, (_value, _cost, _pnl_abs, _pnl_pct) in _held:
+            _drift_rows.append({
+                "ticker": t,
+                "target": st.session_state.allocs.get(t, 0.0),
+                "current": (_value / _total_value * 100.0) if _total_value else 0.0,
+            })
+        _ddf = pd.DataFrame(_drift_rows).sort_values("target", ascending=False)
+        fig_a = go.Figure()
+        fig_a.add_trace(go.Bar(
+            name="Target %", x=_ddf["ticker"], y=_ddf["target"],
+            marker_color="#CBD5E1",
+            hovertemplate="<b>%{x}</b><br>Target %{y:.1f}%<extra></extra>",
+        ))
+        fig_a.add_trace(go.Bar(
+            name="Current %", x=_ddf["ticker"], y=_ddf["current"],
+            marker_color="#0F172A",
+            hovertemplate="<b>%{x}</b><br>Current %{y:.1f}%<extra></extra>",
+        ))
+        fig_a.update_layout(
+            barmode="group", bargap=0.25, bargroupgap=0.08,
+            height=320, margin=dict(l=40, r=20, t=10, b=40),
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=11)),
+        )
+        fig_a.update_xaxes(tickfont=dict(color="#64748B", size=11,
+                                        family="JetBrains Mono, monospace"))
+        fig_a.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11),
+                           ticksuffix="%", zeroline=False)
+        st.plotly_chart(fig_a, use_container_width=True, config={"displayModeBar": False})
+
+        # ---------- Portfolio value over time
+        st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+        st.caption("Portfolio value over time · assuming current units held")
+
+        # Align history series across all held tickers, multiply by units, sum.
+        _value_frames = {}
+        _total_cost_basis = 0.0
+        for t, _ in _held:
+            _pd = st.session_state.price_data.get(t)
+            _meta = st.session_state.etfs.get(t) or {}
+            _units = _meta.get("units")
+            _avg = _meta.get("avg_price")
+            if not _pd or _units is None or _avg is None:
+                continue
+            _h = _pd.get("history")
+            if _h is None or _h.empty:
+                continue
+            _s = _h.set_index(pd.to_datetime(_h["date"]))["price"].astype(float) * float(_units)
+            _value_frames[t] = _s
+            _total_cost_basis += float(_avg) * float(_units)
+
+        if _value_frames and _total_cost_basis > 0:
+            _vdf = pd.DataFrame(_value_frames).sort_index().ffill().dropna(how="all")
+            _vdf["total"] = _vdf.sum(axis=1)
+            fig_pv = go.Figure()
+            fig_pv.add_trace(go.Scatter(
+                x=_vdf.index, y=_vdf["total"], mode="lines",
+                line=dict(color="#0F172A", width=2),
+                fill="tozeroy", fillcolor="rgba(15,23,42,0.05)",
+                name="Portfolio value",
+                hovertemplate="%{x|%d %b %Y}<br>£%{y:,.0f}<extra></extra>",
+            ))
+            fig_pv.add_hline(
+                y=_total_cost_basis,
+                line_dash="dash", line_color="#3B82F6", line_width=1.5,
+                annotation_text=f"Cost basis £{_total_cost_basis:,.0f}",
+                annotation_position="top left",
+                annotation_font=dict(size=10, color="#3B82F6"),
+            )
+            fig_pv.update_layout(
+                height=360, margin=dict(l=50, r=20, t=10, b=40),
+                paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+                showlegend=False,
+            )
+            fig_pv.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+            fig_pv.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11),
+                                tickprefix="£", zeroline=False)
+            st.plotly_chart(fig_pv, use_container_width=True, config={"displayModeBar": False})
+            st.caption(
+                f"Assumes you held {sum(1 for _ in _value_frames)} positions "
+                "with current unit counts throughout — historical reconstruction, "
+                "not actual past portfolio. Useful for break-even visualisation."
+            )
+
 # ----------------------------------------------------------------------------- Deep dive
 with tab_deep:
     _tickers = list(st.session_state.etfs.keys())
@@ -1297,6 +1438,46 @@ with tab_deep:
             fig_c.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
             fig_c.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
             st.plotly_chart(fig_c, use_container_width=True, config={"displayModeBar": False})
+
+            # ----- P&L over time for this position (when cost basis is set)
+            _avg_for_pnl = _info.get("avg_price")
+            _units_for_pnl = _info.get("units")
+            if _avg_for_pnl and _units_for_pnl:
+                st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+                st.caption(
+                    f"Position P/L over time · {_units_for_pnl:.0f} units at "
+                    f"avg £{_avg_for_pnl:,.2f} (historical reconstruction)"
+                )
+                _pnl_series = (_hist["price"].astype(float) - float(_avg_for_pnl)) * float(_units_for_pnl)
+                _pnl_pos = _pnl_series.where(_pnl_series >= 0)
+                _pnl_neg = _pnl_series.where(_pnl_series < 0)
+                fig_pp = go.Figure()
+                # Positive area
+                fig_pp.add_trace(go.Scatter(
+                    x=_hist["date"], y=_pnl_pos, mode="lines",
+                    line=dict(color="#00C896", width=1.5),
+                    fill="tozeroy", fillcolor="rgba(0,200,150,0.15)",
+                    name="Profit", showlegend=False,
+                    hovertemplate="%{x|%d %b %Y}<br>£%{y:,.0f}<extra></extra>",
+                ))
+                # Negative area
+                fig_pp.add_trace(go.Scatter(
+                    x=_hist["date"], y=_pnl_neg, mode="lines",
+                    line=dict(color="#EF4444", width=1.5),
+                    fill="tozeroy", fillcolor="rgba(239,68,68,0.15)",
+                    name="Loss", showlegend=False,
+                    hovertemplate="%{x|%d %b %Y}<br>£%{y:,.0f}<extra></extra>",
+                ))
+                fig_pp.add_hline(y=0, line_color="#94A3B8", line_width=1)
+                fig_pp.update_layout(
+                    height=240, margin=dict(l=50, r=20, t=10, b=30),
+                    paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                    font=dict(family="Helvetica Neue", size=11, color="#0F172A"),
+                )
+                fig_pp.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10))
+                fig_pp.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10),
+                                    tickprefix="£", zeroline=False)
+                st.plotly_chart(fig_pp, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
 

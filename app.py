@@ -15,13 +15,42 @@ import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
+import numpy as np
 import anthropic
 import json
 from datetime import datetime, timedelta, date as _date
+from pathlib import Path
 
 import db
 import signals as sg
 import core
+
+# =============================================================================
+# Holdings persistence (cost basis: avg_price + units per ticker)
+# =============================================================================
+
+HOLDINGS_PATH = Path(__file__).parent / "data" / "holdings.json"
+
+
+def load_holdings() -> dict:
+    """Return {ticker: {avg_price, units}} from disk, or {} if missing/corrupt."""
+    if HOLDINGS_PATH.exists():
+        try:
+            return json.loads(HOLDINGS_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_holdings(etfs: dict) -> None:
+    """Persist avg_price + units per ticker to data/holdings.json (gitignored)."""
+    HOLDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        t: {"avg_price": v["avg_price"], "units": v["units"]}
+        for t, v in etfs.items()
+        if v.get("avg_price") is not None and v.get("units") is not None
+    }
+    HOLDINGS_PATH.write_text(json.dumps(payload, indent=2))
 
 # =============================================================================
 # Page config + global CSS override
@@ -276,7 +305,13 @@ DEFAULT_ALLOCS = {
 # Session state initialisation
 # =============================================================================
 
-if "etfs"            not in st.session_state: st.session_state.etfs = DEFAULT_ETFS.copy()
+if "etfs" not in st.session_state:
+    st.session_state.etfs = DEFAULT_ETFS.copy()
+    # Merge persisted holdings (avg_price + units) into the ETF metadata
+    for _t, _h in load_holdings().items():
+        if _t in st.session_state.etfs:
+            st.session_state.etfs[_t]["avg_price"] = _h.get("avg_price")
+            st.session_state.etfs[_t]["units"]     = _h.get("units")
 if "allocs"          not in st.session_state: st.session_state.allocs = DEFAULT_ALLOCS.copy()
 if "news_data"       not in st.session_state: st.session_state.news_data = {}
 if "analysis"        not in st.session_state: st.session_state.analysis = ""
@@ -484,9 +519,14 @@ def render_changes_strip(changes):
 # =============================================================================
 
 def rating_html(rating):
-    """Return HTML for rating pill."""
+    """Return HTML for rating pill. Falls back to a muted dash when no rating."""
+    if not rating:
+        return (
+            '<span class="rating-pill" style="background:#F1F5F9;color:#94A3B8;'
+            'font-weight:600;">—</span>'
+        )
     cls = {"buy":"rating-buy", "hold":"rating-hold", "sell":"rating-sell"}.get(rating.lower(), "rating-hold")
-    return f'<span class="rating-pill {cls}">{(rating or "—").upper()}</span>'
+    return f'<span class="rating-pill {cls}">{rating.upper()}</span>'
 
 def pct_color(v):
     """Return color for percentage value."""
@@ -500,8 +540,56 @@ def fmt_signed_pct(v, digits=2):
     return ("+" + s if v > 0 else s) + "%"
 
 
+def fmt_money(v, digits=0):
+    """Format GBP amount with thousands separator and sign."""
+    sign = "+" if v > 0 else ("−" if v < 0 else "")
+    return f"{sign}£{abs(v):,.{digits}f}"
+
+
+def position_pnl(ticker):
+    """
+    Returns (current_value, cost_basis, pnl_abs, pnl_pct) or None if cost
+    basis isn't set or the price data is missing.
+    """
+    info = st.session_state.etfs.get(ticker) or {}
+    avg = info.get("avg_price")
+    units = info.get("units")
+    pd_ = st.session_state.price_data.get(ticker)
+    if avg is None or units is None or not pd_:
+        return None
+    current = pd_.get("current")
+    if not current:
+        return None
+    cost = float(avg) * float(units)
+    value = float(current) * float(units)
+    pnl_abs = value - cost
+    pnl_pct = (current / avg - 1.0) * 100.0 if avg else 0.0
+    return value, cost, pnl_abs, pnl_pct
+
+
+def portfolio_pnl():
+    """Sum (current_value, cost_basis, pnl_abs, pnl_pct_weighted) across all
+    ETFs with holdings entered, or None if no holdings exist."""
+    total_value = 0.0
+    total_cost = 0.0
+    any_held = False
+    for t in st.session_state.etfs:
+        p = position_pnl(t)
+        if p is None:
+            continue
+        any_held = True
+        value, cost, _, _ = p
+        total_value += value
+        total_cost += cost
+    if not any_held or total_cost <= 0:
+        return None
+    pnl_abs = total_value - total_cost
+    pnl_pct = (total_value / total_cost - 1.0) * 100.0
+    return total_value, total_cost, pnl_abs, pnl_pct
+
+
 def _render_etf_edit_popover(ticker, info):
-    """Inline popover UI for changing an ETF's category and re-verifying its Yahoo symbol."""
+    """Inline popover UI for category, cost basis, and re-verifying the Yahoo symbol."""
     st.caption("Category")
     new_cat = st.radio(
         "Category", ["Core", "Satellite"],
@@ -511,6 +599,33 @@ def _render_etf_edit_popover(ticker, info):
     )
     if new_cat != info["cat"]:
         st.session_state.etfs[ticker]["cat"] = new_cat
+        st.rerun()
+
+    st.caption("Holdings")
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        new_avg = st.number_input(
+            "Avg price (£)", min_value=0.0, step=0.01,
+            value=float(info.get("avg_price") or 0.0),
+            key=f"avg_{ticker}",
+            help="Average price per share you paid, in £.",
+        )
+    with hc2:
+        new_units = st.number_input(
+            "Units", min_value=0.0, step=1.0,
+            value=float(info.get("units") or 0.0),
+            key=f"units_{ticker}",
+            help="Number of shares held.",
+        )
+    if st.button("Save holdings", key=f"hold_save_{ticker}", use_container_width=True):
+        # Treat zeros as "cleared" — drop fields so P&L row hides
+        if new_avg > 0 and new_units > 0:
+            st.session_state.etfs[ticker]["avg_price"] = new_avg
+            st.session_state.etfs[ticker]["units"] = new_units
+        else:
+            st.session_state.etfs[ticker].pop("avg_price", None)
+            st.session_state.etfs[ticker].pop("units", None)
+        save_holdings(st.session_state.etfs)
         st.rerun()
 
     st.caption("Yahoo symbol")
@@ -760,9 +875,20 @@ weighted_3m = sum(
     for t, pd_ in st.session_state.price_data.items() if pd_
 )
 n_positions = len(st.session_state.etfs)
+_port_pnl = portfolio_pnl()
+_pnl_segment = ""
+if _port_pnl:
+    _value, _cost, _pnl_abs, _pnl_pct = _port_pnl
+    _c = pct_color(_pnl_pct)
+    _pnl_segment = (
+        f" · <span class='mono' style='font-weight:600;color:#0F172A;'>Value £{_value:,.0f}</span>"
+        f" · <span class='mono' style='font-weight:600;color:{_c};'>"
+        f"P/L {fmt_money(_pnl_abs)} ({fmt_signed_pct(_pnl_pct, 1)})</span>"
+    )
 st.markdown(
     f"<div style='color:#64748B;font-size:13px;margin-bottom:24px;'>"
     f"{n_positions} positions"
+    f"{_pnl_segment}"
     f" · <span class='mono' style='color:{pct_color(weighted_1m)};font-weight:600;'>"
     f"1M {fmt_signed_pct(weighted_1m, 1)}</span>"
     f" · <span class='mono' style='color:{pct_color(weighted_3m)};font-weight:600;'>"
@@ -775,12 +901,12 @@ st.markdown(
 # Tabs
 # =============================================================================
 
-tab_pos, tab_perf, tab_news, tab_analysis = st.tabs(
-    ["Positions", "Performance", "News & signals", "Analysis"]
+tab_over, tab_perf, tab_deep, tab_ai = st.tabs(
+    ["Overview", "Performance", "Deep dive", "Insights"]
 )
 
-# ----------------------------------------------------------------------------- Positions
-with tab_pos:
+# ----------------------------------------------------------------------------- Overview
+with tab_over:
     # "What changed since last refresh" strip
     changes_html = render_changes_strip(st.session_state.changes)
     if changes_html:
@@ -794,13 +920,13 @@ with tab_pos:
 
     def render_etf_card(ticker):
         info = st.session_state.etfs[ticker]
-        rating_data = st.session_state.news_data.get(ticker, {})
-        rating = rating_data.get("rating", "hold")
+        rating_data = st.session_state.news_data.get(ticker)
+        rating = (rating_data or {}).get("rating", "")  # empty when news not fetched
         price_data = st.session_state.price_data.get(ticker)
-        n_items = rating_data.get("news", [])
         sig = st.session_state.signals_data.get(ticker) or {}
         flags = sig.get("flags", {})
         score = sig.get("score", 50.0)
+        pnl = position_pnl(ticker)
 
         with st.container(border=True):
             top1, top2 = st.columns([3, 1])
@@ -836,7 +962,7 @@ with tab_pos:
                 if price_data and not price_data.get("history", pd.DataFrame()).empty:
                     last_price = price_data["current"]
                     st.markdown(
-                        f"<div class='mono' style='font-size:18px;font-weight:600;text-align:right;'>£{last_price:.2f}</div>"
+                        f"<div class='mono' style='font-size:18px;font-weight:600;text-align:right;'>£{last_price:,.2f}</div>"
                         f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;text-align:right;'>last close</div>",
                         unsafe_allow_html=True,
                     )
@@ -852,30 +978,20 @@ with tab_pos:
                         unsafe_allow_html=True,
                     )
 
-            label = f"News ({len(n_items)})"
-            with st.expander(label, expanded=False):
-                if not n_items:
-                    st.caption("No recent news.")
-                else:
-                    for n in n_items[:5]:
-                        if isinstance(n, dict):
-                            impact = n.get("impact", "low").upper()
-                            text = n.get("text", "")
-                            source = n.get("source", "")
-                            url = n.get("url", "")
-                            impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
-                            impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
-                            source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
-                            st.markdown(
-                                f"<div style='padding:8px 0;border-bottom:1px solid #E5E7EB;'>"
-                                f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
-                                f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
-                                f"{source_html}"
-                                f"</div>"
-                                f"<div style='font-size:12px;line-height:1.4;color:#0F172A;'>{text}</div>"
-                                f"</div>",
-                                unsafe_allow_html=True,
-                            )
+            # P&L row — only when holdings are set on this ticker
+            if pnl:
+                _value, _cost, _pnl_abs, _pnl_pct = pnl
+                _c = pct_color(_pnl_pct)
+                st.markdown(
+                    f"<div style='margin-top:8px;padding-top:8px;border-top:1px solid #E5E7EB;"
+                    f"display:flex;justify-content:space-between;align-items:baseline;'>"
+                    f"<span style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>P/L</span>"
+                    f"<span class='mono' style='font-size:13px;font-weight:600;color:{_c};'>"
+                    f"{fmt_money(_pnl_abs)} <span style='font-size:11px;font-weight:500;'>({fmt_signed_pct(_pnl_pct,1)})</span>"
+                    f"</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
     # --- core section
     core_pct = sum(st.session_state.allocs.get(t, 0) for t in core_etfs)
@@ -1040,70 +1156,318 @@ with tab_perf:
                           ticksuffix="%", zeroline=False)
         st.plotly_chart(fig4, use_container_width=True, config={"displayModeBar": False})
 
-# ----------------------------------------------------------------------------- News & signals
-with tab_news:
-    high_items = []
-    for t, data in st.session_state.news_data.items():
-        for n in data.get("news", []):
-            if isinstance(n, dict) and n.get("impact", "").lower() == "high":
-                high_items.append((t, n))
+# ----------------------------------------------------------------------------- Deep dive
+with tab_deep:
+    _tickers = list(st.session_state.etfs.keys())
+    if not _tickers:
+        st.info("Add an ETF in the sidebar to see its deep-dive view.")
+    else:
+        _pick = st.selectbox(
+            "ETF",
+            options=_tickers,
+            format_func=lambda t: f"{t} — {st.session_state.etfs[t]['name']}",
+            key="deep_pick",
+        )
+        _info = st.session_state.etfs[_pick]
+        _pd = st.session_state.price_data.get(_pick)
 
-    st.caption(f"High-impact news · {len(high_items)} items")
+        if not _pd or _pd.get("history", pd.DataFrame()).empty:
+            st.warning(
+                f"No price data for {_pick}. Click ↻ Refresh prices in the sidebar."
+            )
+        else:
+            _hist = _pd["history"].copy()
+            _hist["date"] = pd.to_datetime(_hist["date"])
+            _hist = _hist.sort_values("date").reset_index(drop=True)
 
-    if high_items:
-        for i in range(0, len(high_items), 2):
-            row = high_items[i:i + 2]
-            cols = st.columns(2)
-            for col, (t, n) in zip(cols, row):
-                with col:
-                    with st.container(border=True):
-                        url = n.get("url", "")
+            # ----- key stats cards
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            with kc1:
+                st.markdown(
+                    f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>Current</div>"
+                    f"<div class='mono' style='font-size:20px;font-weight:600;'>£{_pd['current']:,.2f}</div>",
+                    unsafe_allow_html=True,
+                )
+            with kc2:
+                if _pd.get("high_52w") and _pd.get("low_52w"):
+                    _lo, _hi = _pd["low_52w"], _pd["high_52w"]
+                    _pos = (_pd["current"] - _lo) / (_hi - _lo) * 100 if _hi > _lo else 50
+                    st.markdown(
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>52w range</div>"
+                        f"<div class='mono' style='font-size:13px;font-weight:600;'>£{_lo:,.2f} – £{_hi:,.2f}</div>"
+                        f"<div style='font-size:10px;color:#64748B;margin-top:2px;'>at {_pos:.0f}% of range</div>",
+                        unsafe_allow_html=True,
+                    )
+            with kc3:
+                _v = _pd.get("vol_30d")
+                _v_str = f"{_v:.1f}%" if _v is not None else "—"
+                st.markdown(
+                    f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>30d vol (ann.)</div>"
+                    f"<div class='mono' style='font-size:20px;font-weight:600;'>{_v_str}</div>",
+                    unsafe_allow_html=True,
+                )
+            with kc4:
+                _b = _pd.get("beta")
+                _dy = _pd.get("dividend_yield")
+                _beta_s = f"{_b:.2f}" if _b is not None else "—"
+                _yld_s = f"{_dy:.2f}%" if _dy is not None else "—"
+                st.markdown(
+                    f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>Beta · Yield</div>"
+                    f"<div class='mono' style='font-size:16px;font-weight:600;'>{_beta_s} · {_yld_s}</div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+
+            # ----- Candlestick + volume (last 120 sessions)
+            st.caption("Price · last 120 sessions (candlestick + volume)")
+            _h120 = _hist.tail(120)
+            from plotly.subplots import make_subplots
+            fig_c = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                  vertical_spacing=0.04, row_heights=[0.72, 0.28])
+            fig_c.add_trace(go.Candlestick(
+                x=_h120["date"],
+                open=_h120["open"], high=_h120["high"],
+                low=_h120["low"],   close=_h120["price"],
+                increasing_line_color="#00C896",
+                decreasing_line_color="#EF4444",
+                name=_pick, showlegend=False,
+            ), row=1, col=1)
+            fig_c.add_trace(go.Bar(
+                x=_h120["date"], y=_h120["volume"],
+                marker_color="#CBD5E1", name="Volume", showlegend=False,
+            ), row=2, col=1)
+            fig_c.update_layout(
+                height=480, margin=dict(l=40, r=20, t=10, b=30),
+                paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
+                xaxis_rangeslider_visible=False,
+            )
+            fig_c.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+            fig_c.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
+            st.plotly_chart(fig_c, use_container_width=True, config={"displayModeBar": False})
+
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+            # ----- Drawdown timeseries + rolling vol
+            dd_col, vol_col = st.columns(2)
+            _close = _hist["price"].astype(float)
+            _peak = _close.cummax()
+            _dd = (_close / _peak - 1.0) * 100.0
+            with dd_col:
+                st.caption("Drawdown from running peak")
+                fig_d = go.Figure()
+                fig_d.add_trace(go.Scatter(
+                    x=_hist["date"], y=_dd, mode="lines",
+                    fill="tozeroy", line=dict(color="#EF4444", width=1.5),
+                    fillcolor="rgba(239,68,68,0.12)", showlegend=False,
+                ))
+                fig_d.add_hline(y=0, line_dash="dash", line_color="#94A3B8", line_width=1)
+                fig_d.update_layout(
+                    height=260, margin=dict(l=40, r=10, t=10, b=30),
+                    paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                    font=dict(family="Helvetica Neue", size=11, color="#0F172A"),
+                )
+                fig_d.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10))
+                fig_d.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10),
+                                   ticksuffix="%", zeroline=False)
+                st.plotly_chart(fig_d, use_container_width=True, config={"displayModeBar": False})
+
+            with vol_col:
+                st.caption("Rolling 30d volatility (annualised)")
+                _daily_ret = _close.pct_change()
+                _rvol = _daily_ret.rolling(30).std() * (252 ** 0.5) * 100
+                fig_v = go.Figure()
+                fig_v.add_trace(go.Scatter(
+                    x=_hist["date"], y=_rvol, mode="lines",
+                    line=dict(color="#3B82F6", width=1.6), showlegend=False,
+                ))
+                fig_v.update_layout(
+                    height=260, margin=dict(l=40, r=10, t=10, b=30),
+                    paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                    font=dict(family="Helvetica Neue", size=11, color="#0F172A"),
+                )
+                fig_v.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10))
+                fig_v.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10),
+                                   ticksuffix="%")
+                st.plotly_chart(fig_v, use_container_width=True, config={"displayModeBar": False})
+
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+            # ----- Returns histogram + monthly heatmap
+            hi_col, hm_col = st.columns(2)
+            with hi_col:
+                st.caption("Daily returns distribution")
+                _r = _daily_ret.dropna() * 100
+                if len(_r):
+                    fig_h = go.Figure()
+                    fig_h.add_trace(go.Histogram(
+                        x=_r, nbinsx=40, marker_color="#0F172A",
+                        opacity=0.85,
+                    ))
+                    fig_h.add_vline(x=0, line_dash="dash", line_color="#94A3B8", line_width=1)
+                    fig_h.update_layout(
+                        height=280, margin=dict(l=40, r=10, t=10, b=30),
+                        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                        font=dict(family="Helvetica Neue", size=11, color="#0F172A"),
+                        bargap=0.02, showlegend=False,
+                    )
+                    fig_h.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10),
+                                       ticksuffix="%")
+                    fig_h.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=10))
+                    st.plotly_chart(fig_h, use_container_width=True, config={"displayModeBar": False})
+
+            with hm_col:
+                st.caption("Monthly returns · last 24 months")
+                _mhist = _hist.set_index("date")["price"].astype(float)
+                _monthly = _mhist.resample("ME").last().pct_change().dropna() * 100
+                _monthly = _monthly.tail(24)
+                if len(_monthly):
+                    _mdf = pd.DataFrame({
+                        "year":  _monthly.index.year,
+                        "month": _monthly.index.month,
+                        "ret":   _monthly.values,
+                    })
+                    _pivot = _mdf.pivot(index="year", columns="month", values="ret")
+                    _pivot.columns = [pd.Timestamp(2000, m, 1).strftime("%b") for m in _pivot.columns]
+                    fig_m = px.imshow(
+                        _pivot, color_continuous_scale="RdYlGn",
+                        zmin=-max(abs(_monthly.min()), abs(_monthly.max())),
+                        zmax= max(abs(_monthly.min()), abs(_monthly.max())),
+                        text_auto=".1f", aspect="auto",
+                    )
+                    fig_m.update_layout(
+                        height=280, margin=dict(l=40, r=10, t=10, b=10),
+                        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                        font=dict(family="Helvetica Neue", size=10, color="#0F172A"),
+                        coloraxis_showscale=False,
+                    )
+                    fig_m.update_xaxes(tickfont=dict(color="#64748B", size=10))
+                    fig_m.update_yaxes(tickfont=dict(color="#64748B", size=10))
+                    st.plotly_chart(fig_m, use_container_width=True, config={"displayModeBar": False})
+
+            # ----- Holdings & P&L panel
+            _pnl = position_pnl(_pick)
+            if _pnl:
+                _value, _cost, _pnl_abs, _pnl_pct = _pnl
+                _c = pct_color(_pnl_pct)
+                _avg = _info.get("avg_price")
+                _units = _info.get("units")
+                _curr = _pd["current"]
+                _diff_per_share = _curr - _avg
+                st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.caption("Your position")
+                    pc1, pc2, pc3, pc4 = st.columns(4)
+                    pc1.markdown(
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>Cost basis</div>"
+                        f"<div class='mono' style='font-size:16px;font-weight:600;'>£{_cost:,.2f}</div>"
+                        f"<div style='font-size:10px;color:#64748B;'>{_units:.0f} × £{_avg:,.2f}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    pc2.markdown(
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>Current value</div>"
+                        f"<div class='mono' style='font-size:16px;font-weight:600;'>£{_value:,.2f}</div>"
+                        f"<div style='font-size:10px;color:#64748B;'>{_units:.0f} × £{_curr:,.2f}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    pc3.markdown(
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>Unrealised P/L</div>"
+                        f"<div class='mono' style='font-size:16px;font-weight:600;color:{_c};'>{fmt_money(_pnl_abs, 2)}</div>"
+                        f"<div class='mono' style='font-size:11px;font-weight:600;color:{_c};'>{fmt_signed_pct(_pnl_pct, 2)}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    pc4.markdown(
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.1em;'>Per share</div>"
+                        f"<div class='mono' style='font-size:16px;font-weight:600;color:{_c};'>{fmt_money(_diff_per_share, 2)}</div>"
+                        f"<div style='font-size:10px;color:#64748B;'>vs £{_avg:,.2f} entry</div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No holdings entered — open Manage ETFs in the sidebar to add an average purchase price + units.")
+
+# ----------------------------------------------------------------------------- Insights (manual)
+with tab_ai:
+    # ---- News section
+    st.markdown(
+        "<div style='font-size:13px;font-weight:600;letter-spacing:0.04em;"
+        "text-transform:uppercase;color:#64748B;margin-bottom:8px;'>📰 News</div>",
+        unsafe_allow_html=True,
+    )
+    if not st.session_state.news_data:
+        st.info(
+            "Click **📰 Refresh news** in the sidebar to fetch latest headlines. "
+            "Costs ~$0.07 per refresh."
+        )
+    else:
+        high_items = []
+        for t, data in st.session_state.news_data.items():
+            for n in data.get("news", []):
+                if isinstance(n, dict) and n.get("impact", "").lower() == "high":
+                    high_items.append((t, n))
+
+        if high_items:
+            st.caption(f"High-impact news · {len(high_items)} items")
+            for i in range(0, len(high_items), 2):
+                row = high_items[i:i + 2]
+                cols = st.columns(2)
+                for col, (t, n) in zip(cols, row):
+                    with col:
+                        with st.container(border=True):
+                            url = n.get("url", "")
+                            source = n.get("source", "")
+                            source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
+                            st.markdown(
+                                f"<div style='margin-bottom:6px;display:flex;align-items:center;gap:6px;'>"
+                                f"<span style='background:#FEF2F2;color:#EF4444;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>HIGH</span>"
+                                f"<span class='mono' style='font-size:11px;font-weight:600;'>{t}</span>"
+                                f"{source_html}"
+                                f"</div>"
+                                f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{n.get('text', '')}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+        st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+        st.caption("All news, by ETF")
+        for ticker in st.session_state.etfs:
+            items = st.session_state.news_data.get(ticker, {}).get("news", [])
+            if not items:
+                continue
+            label = f"{ticker} · {st.session_state.etfs[ticker]['name']} ({len(items)})"
+            with st.expander(label, expanded=False):
+                for n in items:
+                    if isinstance(n, dict):
+                        impact = n.get("impact", "low").upper()
+                        text = n.get("text", "")
                         source = n.get("source", "")
+                        url = n.get("url", "")
+                        impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
+                        impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
                         source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
                         st.markdown(
-                            f"<div style='margin-bottom:6px;display:flex;align-items:center;gap:6px;'>"
-                            f"<span style='background:#FEF2F2;color:#EF4444;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>HIGH</span>"
-                            f"<span class='mono' style='font-size:11px;font-weight:600;'>{t}</span>"
+                            f"<div style='padding:10px 0;border-bottom:1px solid #E5E7EB;'>"
+                            f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
+                            f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
                             f"{source_html}"
                             f"</div>"
-                            f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{n.get('text', '')}</div>",
+                            f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{text}</div>"
+                            f"</div>",
                             unsafe_allow_html=True,
                         )
 
-    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
 
-    st.caption("All news, by ETF")
-    for ticker in st.session_state.etfs:
-        items = st.session_state.news_data.get(ticker, {}).get("news", [])
-        if not items:
-            continue
-        label = f"{ticker} · {st.session_state.etfs[ticker]['name']} ({len(items)})"
-        with st.expander(label, expanded=False):
-            for n in items:
-                if isinstance(n, dict):
-                    impact = n.get("impact", "low").upper()
-                    text = n.get("text", "")
-                    source = n.get("source", "")
-                    url = n.get("url", "")
-                    impact_color = {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#94A3B8"}.get(impact, "#94A3B8")
-                    impact_bg = {"HIGH": "#FEF2F2", "MEDIUM": "#FEF3C7", "LOW": "#F1F3F6"}.get(impact, "#F1F3F6")
-                    source_html = f'<a href="{url}" target="_blank" style="color:#64748B;font-size:10px;text-decoration:none;">{source} ↗</a>' if url else f'<span style="color:#64748B;font-size:10px;">{source}</span>'
-                    st.markdown(
-                        f"<div style='padding:10px 0;border-bottom:1px solid #E5E7EB;'>"
-                        f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:4px;'>"
-                        f"<span style='background:{impact_bg};color:{impact_color};font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:0.08em;'>{impact}</span>"
-                        f"{source_html}"
-                        f"</div>"
-                        f"<div style='font-size:13px;line-height:1.4;color:#0F172A;'>{text}</div>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-# ----------------------------------------------------------------------------- Analysis
-with tab_analysis:
-    st.caption("Portfolio analysis")
+    # ---- Analysis section
+    st.markdown(
+        "<div style='font-size:13px;font-weight:600;letter-spacing:0.04em;"
+        "text-transform:uppercase;color:#64748B;margin-bottom:8px;'>✨ Portfolio analysis</div>",
+        unsafe_allow_html=True,
+    )
     if st.session_state.analysis:
         with st.container(border=True):
             st.markdown(st.session_state.analysis)
     else:
-        st.info("Click **Analyse portfolio** in the sidebar to generate AI-powered insights.")
+        st.info(
+            "Click **✨ Analyse portfolio** in the sidebar to generate "
+            "AI-powered insights. Costs ~$0.02 per run."
+        )

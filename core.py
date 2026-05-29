@@ -33,24 +33,58 @@ def fetch_price_data_raw(etf_pairs):
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
             close = raw["Close"].dropna()
-            volume = raw["Volume"].dropna() if "Volume" in raw.columns else None
             if len(close) < 2:
                 results[ticker] = None
                 continue
+
+            # Detect Yahoo's GBp (pence) quote convention and convert to GBP.
+            # LSE-listed ETFs are usually quoted in pence (e.g. 9023 = £90.23).
+            # Without this fix, prices and any user-entered cost basis would be
+            # off by 100x.
+            divisor = 1.0
+            ccy = None
+            try:
+                ccy = getattr(yf.Ticker(yahoo).fast_info, "currency", None)
+            except Exception:
+                pass
+            if ccy and str(ccy).lower() == "gbp" and close.iloc[-1] > 1000:
+                # Some Yahoo records label LSE pence as "GBP" but the price
+                # magnitude betrays it — guard with a magnitude check.
+                divisor = 100.0
+            elif ccy and str(ccy) == "GBp":
+                divisor = 100.0
+
+            close = close / divisor
+            open_  = (raw["Open"]  / divisor).reindex(close.index)
+            high   = (raw["High"]  / divisor).reindex(close.index)
+            low    = (raw["Low"]   / divisor).reindex(close.index)
+            volume = raw["Volume"].reindex(close.index) if "Volume" in raw.columns else None
+
             now = float(close.iloc[-1])
             w1 = float(close.iloc[-6]) if len(close) >= 6 else now
             m1 = float(close.iloc[-22]) if len(close) >= 22 else now
             m3 = float(close.iloc[-66]) if len(close) >= 66 else now
             vol_30d = (float(close.pct_change().tail(22).std() * (252 ** 0.5) * 100)
                        if len(close) >= 5 else None)
+
+            history_df = pd.DataFrame({
+                "date":   close.index,
+                "open":   open_.values,
+                "high":   high.values,
+                "low":    low.values,
+                "price":  close.values,  # keep "price" for backward compat
+                "volume": (volume.values if volume is not None else [0] * len(close)),
+            })
+
             entry = {
                 "current": now,
                 "ret_1w": (now - w1) / w1 * 100,
                 "ret_1m": (now - m1) / m1 * 100,
                 "ret_3m": (now - m3) / m3 * 100,
-                "history": pd.DataFrame({"date": close.index, "price": close.values}),
+                "history": history_df,
                 "volume": pd.Series(volume.values, index=volume.index) if volume is not None else None,
                 "vol_30d": vol_30d,
+                "currency": "GBP" if divisor == 100.0 else (ccy or "GBP"),
                 "high_52w": None, "low_52w": None, "drawdown": None,
                 "year_change": None, "avg_volume_3m": None,
                 "beta": None, "dividend_yield": None,
@@ -59,9 +93,9 @@ def fetch_price_data_raw(etf_pairs):
                 fi = yf.Ticker(yahoo).fast_info
                 h52 = getattr(fi, "fifty_two_week_high", None)
                 l52 = getattr(fi, "fifty_two_week_low", None)
-                entry["high_52w"] = float(h52) if h52 else None
-                entry["low_52w"] = float(l52) if l52 else None
-                entry["drawdown"] = (now / h52 - 1) * 100 if h52 else None
+                entry["high_52w"] = float(h52) / divisor if h52 else None
+                entry["low_52w"]  = float(l52) / divisor if l52 else None
+                entry["drawdown"] = (now / entry["high_52w"] - 1) * 100 if entry["high_52w"] else None
                 yc = getattr(fi, "year_change", None)
                 entry["year_change"] = float(yc) * 100 if yc is not None else None
                 av = getattr(fi, "three_month_average_volume", None)

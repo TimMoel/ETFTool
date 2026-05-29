@@ -94,8 +94,9 @@ def format_changes_message(changes):
 
 def main():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set", file=sys.stderr)
+    news_enabled = os.environ.get("ENABLE_NEWS", "").lower() in ("1", "true", "yes")
+    if news_enabled and not api_key:
+        print("ERROR: ENABLE_NEWS=1 but ANTHROPIC_API_KEY not set", file=sys.stderr)
         return 1
 
     print("Fetching prices…")
@@ -103,11 +104,18 @@ def main():
     price_data = core.fetch_price_data_raw(etf_pairs)
     print(f"  prices: {sum(1 for v in price_data.values() if v)} / {len(ETFS)} ETFs")
 
-    print("Fetching news…")
-    try:
-        news_data = core.fetch_news_and_ratings_raw(ETFS, api_key)
-    except Exception as e:
-        print(f"  news fetch failed: {e}", file=sys.stderr)
+    if news_enabled:
+        print("Fetching news (ENABLE_NEWS=1)…")
+        try:
+            news_data = core.fetch_news_and_ratings_raw(ETFS, api_key)
+        except Exception as e:
+            print(f"  news fetch failed: {e}", file=sys.stderr)
+            news_data = {t: {"rating": "hold", "sentiment": "neutral", "news": []}
+                         for t in ETFS}
+    else:
+        print("News fetch disabled (set ENABLE_NEWS=1 to re-enable). "
+              "Snapshots will use rating=hold; alerts will only fire on "
+              "price-driven signals (MA crosses, new highs/lows).")
         news_data = {t: {"rating": "hold", "sentiment": "neutral", "news": []}
                      for t in ETFS}
 

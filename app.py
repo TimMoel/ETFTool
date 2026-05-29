@@ -848,6 +848,25 @@ st.markdown("# ETF Tracker")
 # Auto-fetch prices on first load
 # =============================================================================
 
+def _has_ohlc(pd_dict):
+    """True only when the history df has the new shape with open/high/low columns."""
+    if not pd_dict:
+        return True  # nothing to check; treat as fresh
+    for v in pd_dict.values():
+        if not v:
+            continue
+        h = v.get("history")
+        if h is None or h.empty:
+            continue
+        return {"open", "high", "low"}.issubset(set(h.columns))
+    return True
+
+# Force a re-fetch when the cached payload predates the OHLC schema change
+if st.session_state.price_data and not _has_ohlc(st.session_state.price_data):
+    st.cache_data.clear()
+    st.session_state.price_data = {}
+    st.session_state.signals_data = {}
+
 if not st.session_state.price_data:
     with st.spinner("Fetching prices…"):
         etf_pairs = tuple((t, v["yahoo"]) for t, v in st.session_state.etfs.items())
@@ -1219,26 +1238,58 @@ with tab_deep:
 
             st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
-            # ----- Candlestick + volume (last 120 sessions)
-            st.caption("Price · last 120 sessions (candlestick + volume)")
+            # ----- Price + volume (last 120 sessions)
             _h120 = _hist.tail(120)
+            _has_ohlc_cols = {"open", "high", "low"}.issubset(set(_h120.columns))
+            _has_vol_col = "volume" in _h120.columns
+
             from plotly.subplots import make_subplots
-            fig_c = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                  vertical_spacing=0.04, row_heights=[0.72, 0.28])
-            fig_c.add_trace(go.Candlestick(
-                x=_h120["date"],
-                open=_h120["open"], high=_h120["high"],
-                low=_h120["low"],   close=_h120["price"],
-                increasing_line_color="#00C896",
-                decreasing_line_color="#EF4444",
-                name=_pick, showlegend=False,
-            ), row=1, col=1)
-            fig_c.add_trace(go.Bar(
-                x=_h120["date"], y=_h120["volume"],
-                marker_color="#CBD5E1", name="Volume", showlegend=False,
-            ), row=2, col=1)
+            if _has_vol_col:
+                fig_c = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                      vertical_spacing=0.04, row_heights=[0.72, 0.28])
+            else:
+                fig_c = go.Figure()
+
+            if _has_ohlc_cols:
+                st.caption("Price · last 120 sessions (candlestick + volume)")
+                fig_c.add_trace(go.Candlestick(
+                    x=_h120["date"],
+                    open=_h120["open"], high=_h120["high"],
+                    low=_h120["low"],   close=_h120["price"],
+                    increasing_line_color="#00C896",
+                    decreasing_line_color="#EF4444",
+                    name=_pick, showlegend=False,
+                ), row=1, col=1)
+            else:
+                st.caption("Price · last 120 sessions")
+                _price_kwargs = {"row": 1, "col": 1} if _has_vol_col else {}
+                fig_c.add_trace(go.Scatter(
+                    x=_h120["date"], y=_h120["price"], mode="lines",
+                    line=dict(color="#0F172A", width=1.8),
+                    name=_pick, showlegend=False,
+                ), **_price_kwargs)
+
+            # Overlay user's average purchase price as a horizontal line
+            _avg_p = _info.get("avg_price")
+            if _avg_p:
+                _line_kwargs = dict(line_dash="dash", line_color="#3B82F6", line_width=1.5,
+                                    annotation_text=f"Avg £{_avg_p:,.2f}",
+                                    annotation_position="top left",
+                                    annotation_font=dict(size=10, color="#3B82F6"))
+                if _has_vol_col:
+                    fig_c.add_hline(y=_avg_p, row=1, col=1, **_line_kwargs)
+                else:
+                    fig_c.add_hline(y=_avg_p, **_line_kwargs)
+
+            if _has_vol_col:
+                fig_c.add_trace(go.Bar(
+                    x=_h120["date"], y=_h120["volume"],
+                    marker_color="#CBD5E1", name="Volume", showlegend=False,
+                ), row=2, col=1)
+
             fig_c.update_layout(
-                height=480, margin=dict(l=40, r=20, t=10, b=30),
+                height=480 if _has_vol_col else 380,
+                margin=dict(l=40, r=20, t=10, b=30),
                 paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
                 font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
                 xaxis_rangeslider_visible=False,

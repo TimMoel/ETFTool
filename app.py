@@ -588,6 +588,153 @@ def portfolio_pnl():
     return total_value, total_cost, pnl_abs, pnl_pct
 
 
+# =============================================================================
+# Time frame, sparkline, watchlist helpers
+# =============================================================================
+
+TIMEFRAMES = ["1W", "1M", "3M", "6M", "1Y", "YTD", "MAX"]
+_TF_DAYS = {"1W": 5, "1M": 22, "3M": 66, "6M": 132, "1Y": 252}
+
+
+def slice_history(history_df, tf):
+    """Return the tail of history_df matching the time frame label."""
+    if history_df is None or history_df.empty:
+        return history_df
+    if tf == "MAX":
+        return history_df
+    if tf == "YTD":
+        cutoff = pd.Timestamp(_date.today().year, 1, 1)
+        dates = pd.to_datetime(history_df["date"])
+        return history_df.loc[dates >= cutoff]
+    n = _TF_DAYS.get(tf, 66)
+    return history_df.tail(n)
+
+
+def return_over_window(history_df, tf):
+    """% return over the chosen time frame, computed from the close column. None if not enough data."""
+    sliced = slice_history(history_df, tf)
+    if sliced is None or len(sliced) < 2:
+        return None
+    start = float(sliced["price"].iloc[0])
+    end   = float(sliced["price"].iloc[-1])
+    if start <= 0:
+        return None
+    return (end / start - 1.0) * 100.0
+
+
+def timeframe_selector(key, default="3M"):
+    """Render the standard time frame segmented control. Returns the chosen label."""
+    chosen = st.segmented_control(
+        "Time frame", options=TIMEFRAMES,
+        default=st.session_state.get(key, default),
+        key=key, label_visibility="collapsed",
+    )
+    return chosen or default
+
+
+def render_sparkline(prices, avg_price=None, width=180, height=44):
+    """Lightweight inline-SVG sparkline. Optional dashed avg-price overlay.
+
+    Color: green if last > entry (or last > first when no avg_price), red otherwise.
+    Returns an HTML string suitable for st.markdown(..., unsafe_allow_html=True).
+    """
+    arr = np.asarray([float(p) for p in prices if p == p], dtype=float)
+    if len(arr) < 2:
+        return ""
+    mn, mx = float(arr.min()), float(arr.max())
+    if avg_price:
+        mn = min(mn, float(avg_price))
+        mx = max(mx, float(avg_price))
+    if mx == mn:
+        mx = mn + 1.0
+    ys = height - (arr - mn) / (mx - mn) * height
+    xs = np.linspace(0, width, len(arr))
+    pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
+    last = float(arr[-1])
+    if avg_price:
+        up = last > float(avg_price)
+    else:
+        up = last > float(arr[0])
+    stroke = "#00C896" if up else "#EF4444"
+    fill   = "rgba(0,200,150,0.10)" if up else "rgba(239,68,68,0.10)"
+    parts = [
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none" style="display:block;">',
+        f'<polygon points="0,{height} {pts} {width},{height}" fill="{fill}" />',
+        f'<polyline points="{pts}" fill="none" stroke="{stroke}" stroke-width="1.5" '
+        f'stroke-linejoin="round" stroke-linecap="round" />',
+    ]
+    if avg_price:
+        y_avg = height - (float(avg_price) - mn) / (mx - mn) * height
+        parts.append(
+            f'<line x1="0" y1="{y_avg:.1f}" x2="{width}" y2="{y_avg:.1f}" '
+            f'stroke="#3B82F6" stroke-width="1" stroke-dasharray="3,3" opacity="0.75"/>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# Visual taxonomy for callouts
+CALLOUT_RED   = ("#EF4444", "#FEF2F2")
+CALLOUT_AMBER = ("#F59E0B", "#FEF3C7")
+CALLOUT_GREEN = ("#00C896", "#E8FAF4")
+
+
+def compute_callouts(ticker):
+    """Return (negative_tags, positive_tags) — lists of (label, severity, fg, bg)."""
+    pd_  = st.session_state.price_data.get(ticker) or {}
+    flags = (st.session_state.signals_data.get(ticker) or {}).get("flags", {})
+    score = (st.session_state.signals_data.get(ticker) or {}).get("score", 50.0)
+    pnl   = position_pnl(ticker)
+
+    neg, pos = [], []
+    if pnl is not None:
+        _, _, _, pnl_pct = pnl
+        if pnl_pct < -5:
+            neg.append(("big loss", f"{fmt_signed_pct(pnl_pct, 1)}", *CALLOUT_RED))
+        elif pnl_pct > 10:
+            pos.append(("big win", f"{fmt_signed_pct(pnl_pct, 1)}", *CALLOUT_GREEN))
+
+    if flags.get("deep_drawdown"):
+        dd = pd_.get("drawdown")
+        sub = f"{dd:+.1f}%" if dd is not None else ""
+        neg.append(("deep drawdown", sub, *CALLOUT_RED))
+    if flags.get("death_cross"):
+        neg.append(("death cross", "50/200 SMA", *CALLOUT_RED))
+
+    if flags.get("high_vol"):
+        v = pd_.get("vol_30d")
+        sub = f"{v:.1f}%" if v is not None else ""
+        neg.append(("high vol", sub, *CALLOUT_AMBER))
+    if flags.get("rsi_overbought"):
+        neg.append(("overbought", "RSI>70", *CALLOUT_AMBER))
+
+    if score < 35:
+        neg.append(("low score", f"{score:.0f}", *CALLOUT_AMBER))
+
+    if flags.get("golden_cross"):
+        pos.append(("golden cross", "50/200 SMA", *CALLOUT_GREEN))
+    if flags.get("near_52w_high") and flags.get("momentum_1m_pos"):
+        pos.append(("hot streak", "near 52w high", *CALLOUT_GREEN))
+    if flags.get("rsi_oversold"):
+        pos.append(("oversold dip", "RSI<30", *CALLOUT_GREEN))
+
+    return neg, pos
+
+
+def score_band_color(score):
+    """Return the colored-border color for a card based on composite score."""
+    if score >= 70:
+        return "#00C896"
+    if score < 35:
+        return "#EF4444"
+    return None  # default border
+
+
+# =============================================================================
+# Popover (re-uses helpers above)
+# =============================================================================
+
 def _render_etf_edit_popover(ticker, info):
     """Inline popover UI for category, cost basis, and re-verifying the Yahoo symbol."""
     st.caption("Category")
@@ -602,31 +749,19 @@ def _render_etf_edit_popover(ticker, info):
         st.rerun()
 
     st.caption("Holdings")
-    hc1, hc2 = st.columns(2)
-    with hc1:
-        new_avg = st.number_input(
-            "Avg price (£)", min_value=0.0, step=0.01,
-            value=float(info.get("avg_price") or 0.0),
-            key=f"avg_{ticker}",
-            help="Average price per share you paid, in £.",
+    _avg = info.get("avg_price")
+    _units = info.get("units")
+    if _avg and _units:
+        st.markdown(
+            f"<span class='mono' style='font-size:12px;'>{_units:.0f} × £{_avg:,.2f}</span>",
+            unsafe_allow_html=True,
         )
-    with hc2:
-        new_units = st.number_input(
-            "Units", min_value=0.0, step=1.0,
-            value=float(info.get("units") or 0.0),
-            key=f"units_{ticker}",
-            help="Number of shares held.",
+    else:
+        st.markdown(
+            "<span style='color:#94A3B8;font-size:11px;'>None set.</span>",
+            unsafe_allow_html=True,
         )
-    if st.button("Save holdings", key=f"hold_save_{ticker}", use_container_width=True):
-        # Treat zeros as "cleared" — drop fields so P&L row hides
-        if new_avg > 0 and new_units > 0:
-            st.session_state.etfs[ticker]["avg_price"] = new_avg
-            st.session_state.etfs[ticker]["units"] = new_units
-        else:
-            st.session_state.etfs[ticker].pop("avg_price", None)
-            st.session_state.etfs[ticker].pop("units", None)
-        save_holdings(st.session_state.etfs)
-        st.rerun()
+    st.caption("Edit all holdings in bulk via the Overview tab.")
 
     st.caption("Yahoo symbol")
     st.markdown(
@@ -881,40 +1016,7 @@ elif not st.session_state.signals_data:
     st.session_state.signals_data = build_signals_for_all(
         st.session_state.price_data, st.session_state.news_data)
 
-# =============================================================================
-# Header stat strip — live weighted returns + position count
-# =============================================================================
-
-weighted_1m = sum(
-    (st.session_state.allocs.get(t, 0) / 100.0) * (pd_.get("ret_1m") or 0)
-    for t, pd_ in st.session_state.price_data.items() if pd_
-)
-weighted_3m = sum(
-    (st.session_state.allocs.get(t, 0) / 100.0) * (pd_.get("ret_3m") or 0)
-    for t, pd_ in st.session_state.price_data.items() if pd_
-)
-n_positions = len(st.session_state.etfs)
-_port_pnl = portfolio_pnl()
-_pnl_segment = ""
-if _port_pnl:
-    _value, _cost, _pnl_abs, _pnl_pct = _port_pnl
-    _c = pct_color(_pnl_pct)
-    _pnl_segment = (
-        f" · <span class='mono' style='font-weight:600;color:#0F172A;'>Value £{_value:,.0f}</span>"
-        f" · <span class='mono' style='font-weight:600;color:{_c};'>"
-        f"P/L {fmt_money(_pnl_abs)} ({fmt_signed_pct(_pnl_pct, 1)})</span>"
-    )
-st.markdown(
-    f"<div style='color:#64748B;font-size:13px;margin-bottom:24px;'>"
-    f"{n_positions} positions"
-    f"{_pnl_segment}"
-    f" · <span class='mono' style='color:{pct_color(weighted_1m)};font-weight:600;'>"
-    f"1M {fmt_signed_pct(weighted_1m, 1)}</span>"
-    f" · <span class='mono' style='color:{pct_color(weighted_3m)};font-weight:600;'>"
-    f"3M {fmt_signed_pct(weighted_3m, 1)}</span>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
+st.markdown("<div style='margin-bottom:8px;'></div>", unsafe_allow_html=True)
 
 # =============================================================================
 # Tabs
@@ -926,7 +1028,251 @@ tab_over, tab_perf, tab_deep, tab_ai = st.tabs(
 
 # ----------------------------------------------------------------------------- Overview
 with tab_over:
+    # ---- Time frame selector (drives hero metrics + sparklines)
+    _tf_over = timeframe_selector("tf_overview", default="3M")
+
+    # ---- Hero KPI strip
+    _port_pnl = portfolio_pnl()
+
+    def _kpi_tile(label, value_html, sub_html="", accent_color="#0F172A"):
+        return (
+            f"<div style='background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;"
+            f"padding:14px 16px;height:100%;'>"
+            f"<div style='font-size:11px;font-weight:600;color:#64748B;text-transform:uppercase;"
+            f"letter-spacing:0.08em;'>{label}</div>"
+            f"<div class='mono' style='font-size:22px;font-weight:600;color:{accent_color};"
+            f"letter-spacing:-0.02em;margin-top:4px;'>{value_html}</div>"
+            f"<div style='font-size:11px;color:#94A3B8;margin-top:2px;'>{sub_html}</div>"
+            f"</div>"
+        )
+
+    # Compute per-ETF return-over-window once, reused for ranking + tile sub
+    _tf_returns = {}
+    for _t, _pd_ in st.session_state.price_data.items():
+        if not _pd_:
+            continue
+        _h = _pd_.get("history")
+        if _h is None or _h.empty:
+            continue
+        _r = return_over_window(_h, _tf_over)
+        if _r is not None:
+            _tf_returns[_t] = _r
+
+    if _port_pnl:
+        _value, _cost, _pnl_abs, _pnl_pct = _port_pnl
+        _pnl_color = pct_color(_pnl_pct)
+        # Top/bottom by P/L %
+        _held_pnls = []
+        for _t in st.session_state.etfs:
+            _pp = position_pnl(_t)
+            if _pp:
+                _held_pnls.append((_t, _pp[3]))
+        _held_pnls.sort(key=lambda x: x[1], reverse=True)
+        _best = _held_pnls[0]  if _held_pnls else None
+        _worst = _held_pnls[-1] if len(_held_pnls) > 1 else None
+        _best_html = (
+            f"{_best[0]} <span style='font-size:13px;color:{pct_color(_best[1])};'>"
+            f"{fmt_signed_pct(_best[1], 1)}</span>"
+        ) if _best else "—"
+        _worst_html = (
+            f"{_worst[0]} <span style='font-size:13px;color:{pct_color(_worst[1])};'>"
+            f"{fmt_signed_pct(_worst[1], 1)}</span>"
+        ) if _worst else "—"
+
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        kc1.markdown(_kpi_tile("Portfolio value", f"£{_value:,.0f}",
+                               f"{len(_held_pnls)} positions held"),
+                     unsafe_allow_html=True)
+        kc2.markdown(_kpi_tile("Unrealised P/L", fmt_money(_pnl_abs),
+                               fmt_signed_pct(_pnl_pct, 2),
+                               accent_color=_pnl_color),
+                     unsafe_allow_html=True)
+        kc3.markdown(_kpi_tile("Top performer", _best_html,
+                               f"by P/L %"),
+                     unsafe_allow_html=True)
+        kc4.markdown(_kpi_tile("Biggest drag", _worst_html,
+                               f"by P/L %"),
+                     unsafe_allow_html=True)
+    else:
+        # Fallback tiles when no holdings entered yet
+        _n = len(st.session_state.etfs)
+        _wtd = sum(
+            (st.session_state.allocs.get(t, 0) / 100.0) * (r or 0)
+            for t, r in _tf_returns.items()
+        )
+        _best = max(_tf_returns.items(), key=lambda kv: kv[1]) if _tf_returns else None
+        _worst = min(_tf_returns.items(), key=lambda kv: kv[1]) if _tf_returns else None
+        _best_html = (
+            f"{_best[0]} <span style='font-size:13px;color:{pct_color(_best[1])};'>"
+            f"{fmt_signed_pct(_best[1], 1)}</span>"
+        ) if _best else "—"
+        _worst_html = (
+            f"{_worst[0]} <span style='font-size:13px;color:{pct_color(_worst[1])};'>"
+            f"{fmt_signed_pct(_worst[1], 1)}</span>"
+        ) if _worst else "—"
+        _core_n = sum(1 for v in st.session_state.etfs.values() if v["cat"] == "Core")
+        _sat_n  = _n - _core_n
+
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        kc1.markdown(_kpi_tile("Positions", f"{_n}",
+                               f"{_core_n} Core · {_sat_n} Satellite"),
+                     unsafe_allow_html=True)
+        kc2.markdown(_kpi_tile(f"Weighted {_tf_over}",
+                               fmt_signed_pct(_wtd, 1),
+                               "allocation × return",
+                               accent_color=pct_color(_wtd)),
+                     unsafe_allow_html=True)
+        kc3.markdown(_kpi_tile(f"Top mover ({_tf_over})", _best_html, ""),
+                     unsafe_allow_html=True)
+        kc4.markdown(_kpi_tile(f"Worst mover ({_tf_over})", _worst_html, ""),
+                     unsafe_allow_html=True)
+
+    # ---- Wide portfolio-value sparkline (only when holdings exist)
+    if _port_pnl:
+        _value_frames = {}
+        _total_cost_basis = 0.0
+        for _t in st.session_state.etfs:
+            _meta = st.session_state.etfs.get(_t) or {}
+            _avg_p = _meta.get("avg_price")
+            _u = _meta.get("units")
+            _pd_ = st.session_state.price_data.get(_t)
+            if not (_avg_p and _u and _pd_):
+                continue
+            _h = _pd_.get("history")
+            if _h is None or _h.empty:
+                continue
+            _s = _h.set_index(pd.to_datetime(_h["date"]))["price"].astype(float) * float(_u)
+            _value_frames[_t] = _s
+            _total_cost_basis += float(_avg_p) * float(_u)
+        if _value_frames and _total_cost_basis > 0:
+            _vdf = pd.DataFrame(_value_frames).sort_index().ffill().dropna(how="all")
+            _vdf["total"] = _vdf.sum(axis=1)
+            _spark_tail = slice_history(
+                pd.DataFrame({"date": _vdf.index, "price": _vdf["total"].values}),
+                _tf_over,
+            )
+            if len(_spark_tail) >= 2:
+                st.markdown(
+                    "<div style='margin-top:10px;'>"
+                    f"<div style='font-size:11px;font-weight:600;color:#64748B;"
+                    f"text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;'>"
+                    f"Portfolio value · {_tf_over}</div>"
+                    + render_sparkline(_spark_tail["price"].values,
+                                       avg_price=_total_cost_basis,
+                                       width=1200, height=70)
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # ---- Bulk holdings editor
+    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+    _any_holdings = any(
+        v.get("avg_price") and v.get("units")
+        for v in st.session_state.etfs.values()
+    )
+    with st.expander("Edit all holdings", expanded=not _any_holdings):
+        _editor_rows = []
+        for _t, _info in st.session_state.etfs.items():
+            _curr = (st.session_state.price_data.get(_t) or {}).get("current")
+            _avg_p = _info.get("avg_price") or 0.0
+            _units = _info.get("units") or 0.0
+            _cost = _avg_p * _units if (_avg_p and _units) else 0.0
+            _val = (_curr or 0.0) * _units if _units else 0.0
+            _pnl_abs = (_val - _cost) if _cost else 0.0
+            _pnl_pct = ((_curr / _avg_p - 1) * 100) if (_curr and _avg_p) else 0.0
+            _editor_rows.append({
+                "Ticker": _t,
+                "Name": _info.get("name", ""),
+                "Avg price (£)": float(_avg_p),
+                "Units": float(_units),
+                "Cost basis": float(_cost),
+                "Current value": float(_val),
+                "P/L (£)": float(_pnl_abs),
+                "P/L %": float(_pnl_pct),
+            })
+        _editor_df = pd.DataFrame(_editor_rows)
+
+        _edited = st.data_editor(
+            _editor_df,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker", disabled=True, width="small"),
+                "Name":   st.column_config.TextColumn("Name", disabled=True),
+                "Avg price (£)": st.column_config.NumberColumn(
+                    "Avg price (£)", min_value=0.0, step=0.01, format="£%.2f"),
+                "Units": st.column_config.NumberColumn(
+                    "Units", min_value=0.0, step=1.0, format="%.0f"),
+                "Cost basis": st.column_config.NumberColumn(
+                    "Cost", disabled=True, format="£%,.0f"),
+                "Current value": st.column_config.NumberColumn(
+                    "Value", disabled=True, format="£%,.0f"),
+                "P/L (£)": st.column_config.NumberColumn(
+                    "P/L (£)", disabled=True, format="£%,.0f"),
+                "P/L %": st.column_config.NumberColumn(
+                    "P/L %", disabled=True, format="%+.2f%%"),
+            },
+            key="holdings_editor",
+        )
+
+        if st.button("Save all holdings", type="primary", key="bulk_save_holdings",
+                     use_container_width=True):
+            for _, _row in _edited.iterrows():
+                _t = _row["Ticker"]
+                _avg_p = float(_row["Avg price (£)"] or 0.0)
+                _units = float(_row["Units"] or 0.0)
+                if _avg_p > 0 and _units > 0:
+                    st.session_state.etfs[_t]["avg_price"] = _avg_p
+                    st.session_state.etfs[_t]["units"] = _units
+                else:
+                    st.session_state.etfs[_t].pop("avg_price", None)
+                    st.session_state.etfs[_t].pop("units", None)
+            save_holdings(st.session_state.etfs)
+            st.toast("Holdings saved ✓", icon="✅")
+            st.rerun()
+
+    # ---- Watchlist / Good shape strip
+    _neg_by_ticker, _pos_by_ticker = {}, {}
+    for _t in st.session_state.etfs:
+        _neg, _pos = compute_callouts(_t)
+        if _neg:
+            _neg_by_ticker[_t] = _neg
+        if _pos:
+            _pos_by_ticker[_t] = _pos
+
+    def _render_pill_row(label, by_ticker):
+        if not by_ticker:
+            return
+        pills = []
+        for _t, _tags in by_ticker.items():
+            for _name, _sub, _fg, _bg in _tags:
+                sub_html = (
+                    f"<span style='font-size:9px;color:{_fg};opacity:0.7;margin-left:4px;'>{_sub}</span>"
+                    if _sub else ""
+                )
+                pills.append(
+                    f"<span style='background:{_bg};color:{_fg};font-size:10px;font-weight:600;"
+                    f"padding:4px 8px;border-radius:6px;margin:0 6px 6px 0;display:inline-block;"
+                    f"white-space:nowrap;'>"
+                    f"<span class='mono' style='font-weight:700;'>{_t}</span>"
+                    f"<span style='margin:0 5px;color:{_fg};opacity:0.6;'>·</span>"
+                    f"{_name}{sub_html}</span>"
+                )
+        st.markdown(
+            f"<div style='margin-top:14px;'>"
+            f"<div style='font-size:11px;font-weight:600;color:#64748B;"
+            f"text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;'>{label}</div>"
+            f"<div>{''.join(pills)}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    _render_pill_row("Needs attention", _neg_by_ticker)
+    _render_pill_row("Good shape", _pos_by_ticker)
+
     # "What changed since last refresh" strip
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
     changes_html = render_changes_strip(st.session_state.changes)
     if changes_html:
         st.markdown(changes_html, unsafe_allow_html=True)
@@ -948,6 +1294,15 @@ with tab_over:
         pnl = position_pnl(ticker)
 
         with st.container(border=True):
+            # Score-band colored bar at top of card (only when score is in green/red band)
+            _band_color = score_band_color(score)
+            if _band_color:
+                st.markdown(
+                    f"<div style='height:3px;background:{_band_color};border-radius:2px;"
+                    f"margin:-2px 0 8px 0;'></div>",
+                    unsafe_allow_html=True,
+                )
+
             top1, top2 = st.columns([3, 1])
             with top1:
                 st.markdown(
@@ -969,6 +1324,21 @@ with tab_over:
                 f"<div style='margin:6px 0 4px 0;line-height:1.8;'>{score_badge}{chips_html}</div>",
                 unsafe_allow_html=True,
             )
+
+            # ---- Sparkline: time-frame-windowed price with optional avg-price overlay
+            if price_data and not price_data.get("history", pd.DataFrame()).empty:
+                _h_card = slice_history(price_data["history"], _tf_over)
+                if _h_card is not None and len(_h_card) >= 2:
+                    _avg_for_spark = info.get("avg_price")
+                    _spark_svg = render_sparkline(
+                        _h_card["price"].values,
+                        avg_price=_avg_for_spark,
+                        width=320, height=46,
+                    )
+                    st.markdown(
+                        f"<div style='margin:4px 0 8px 0;'>{_spark_svg}</div>",
+                        unsafe_allow_html=True,
+                    )
 
             mid1, mid2 = st.columns(2)
             with mid1:
@@ -1042,7 +1412,8 @@ with tab_over:
 
 # ----------------------------------------------------------------------------- Performance
 with tab_perf:
-    st.caption("Normalised price · 90 days, rebased to 100")
+    _tf_perf = timeframe_selector("tf_performance", default="3M")
+    st.caption(f"Normalised price · {_tf_perf}, rebased to 100")
 
     all_tickers = list(st.session_state.etfs.keys())
     default_picks = [t for t in ["VWRP", "SPDR", "NATP", "NUCG", "RBTX"] if t in all_tickers]
@@ -1058,7 +1429,9 @@ with tab_perf:
     for i, t in enumerate(picks):
         price_info = st.session_state.price_data.get(t)
         if price_info and not price_info.get("history", pd.DataFrame()).empty:
-            df = price_info["history"]
+            df = slice_history(price_info["history"], _tf_perf)
+            if df is None or df.empty:
+                continue
             base = df["price"].iloc[0]
             rebased = (df["price"] / base) * 100.0
             fig.add_trace(go.Scatter(
@@ -1082,15 +1455,22 @@ with tab_perf:
     st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
 
     # ---------- Risk / return scatter
-    st.caption("Risk vs return · 3-month return × 30-day volatility")
+    st.caption(f"Risk vs return · {_tf_perf} return × {_tf_perf} volatility")
     scatter_rows = []
     for t, info in st.session_state.etfs.items():
         pd_ = st.session_state.price_data.get(t)
         if not pd_: continue
+        _h = pd_.get("history")
+        _ret = return_over_window(_h, _tf_perf) if _h is not None else None
+        _sl = slice_history(_h, _tf_perf) if _h is not None else None
+        if _sl is not None and len(_sl) > 1:
+            _vol = float(_sl["price"].pct_change().std() * (252 ** 0.5) * 100)
+        else:
+            _vol = pd_.get("vol_30d") or 0.0
         scatter_rows.append({
             "ticker": t,
-            "ret_3m": pd_.get("ret_3m") or 0.0,
-            "vol_30d": pd_.get("vol_30d") or 0.0,
+            "ret": _ret if _ret is not None else 0.0,
+            "vol": _vol,
             "allocation": st.session_state.allocs.get(t, 0.0),
             "rating": (st.session_state.news_data.get(t) or {}).get("rating", "hold").upper(),
         })
@@ -1098,7 +1478,7 @@ with tab_perf:
         sdf = pd.DataFrame(scatter_rows)
         rating_colors = {"BUY": "#00C896", "HOLD": "#F59E0B", "SELL": "#EF4444"}
         fig2 = px.scatter(
-            sdf, x="ret_3m", y="vol_30d", size="allocation", color="rating",
+            sdf, x="ret", y="vol", size="allocation", color="rating",
             text="ticker", color_discrete_map=rating_colors,
             size_max=44, hover_data={"allocation": ":.1f"},
         )
@@ -1109,7 +1489,7 @@ with tab_perf:
             paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
             font=dict(family="Helvetica Neue", size=12, color="#0F172A"),
             legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=11), title=None),
-            xaxis_title="3-month return (%)", yaxis_title="30-day volatility (%)",
+            xaxis_title=f"{_tf_perf} return (%)", yaxis_title=f"{_tf_perf} annualised volatility (%)",
         )
         fig2.update_xaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
         fig2.update_yaxes(gridcolor="#E5E7EB", tickfont=dict(color="#64748B", size=11))
@@ -1117,15 +1497,17 @@ with tab_perf:
 
     st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
 
-    # ---------- Correlation heatmap (90-day daily returns)
-    st.caption("Correlation · 90-day daily returns")
+    # ---------- Correlation heatmap (windowed daily returns)
+    st.caption(f"Correlation · {_tf_perf} daily returns")
     ret_frames = {}
     for t in st.session_state.etfs:
         pd_ = st.session_state.price_data.get(t)
         if pd_ and not pd_.get("history", pd.DataFrame()).empty:
-            h = pd_["history"].copy()
-            h = h.set_index("date")["price"].astype(float)
-            ret_frames[t] = h.pct_change().dropna().tail(90)
+            h = slice_history(pd_["history"], _tf_perf)
+            if h is None or h.empty:
+                continue
+            s = h.set_index("date")["price"].astype(float)
+            ret_frames[t] = s.pct_change().dropna()
     if len(ret_frames) >= 2:
         corr_df = pd.DataFrame(ret_frames).corr()
         fig3 = px.imshow(
@@ -1145,13 +1527,16 @@ with tab_perf:
     st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
 
     # ---------- Drawdown over time
-    st.caption("Drawdown from running peak · %")
+    st.caption(f"Drawdown from running peak · {_tf_perf}")
     fig4 = go.Figure()
     plotted = 0
     for i, t in enumerate(picks):
         pd_ = st.session_state.price_data.get(t)
         if not pd_ or pd_.get("history", pd.DataFrame()).empty: continue
-        h = pd_["history"].copy().sort_values("date")
+        h = slice_history(pd_["history"], _tf_perf)
+        if h is None or h.empty:
+            continue
+        h = h.sort_values("date")
         price = h["price"].astype(float)
         peak = price.cummax()
         dd = (price / peak - 1) * 100
@@ -1285,6 +1670,13 @@ with tab_perf:
         if _value_frames and _total_cost_basis > 0:
             _vdf = pd.DataFrame(_value_frames).sort_index().ffill().dropna(how="all")
             _vdf["total"] = _vdf.sum(axis=1)
+            _vdf_sliced = slice_history(
+                pd.DataFrame({"date": _vdf.index, "price": _vdf["total"].values}),
+                _tf_perf,
+            )
+            if _vdf_sliced is not None and not _vdf_sliced.empty:
+                _vdf = _vdf_sliced.set_index("date")
+                _vdf["total"] = _vdf["price"]
             fig_pv = go.Figure()
             fig_pv.add_trace(go.Scatter(
                 x=_vdf.index, y=_vdf["total"], mode="lines",
@@ -1322,12 +1714,17 @@ with tab_deep:
     if not _tickers:
         st.info("Add an ETF in the sidebar to see its deep-dive view.")
     else:
-        _pick = st.selectbox(
-            "ETF",
-            options=_tickers,
-            format_func=lambda t: f"{t} — {st.session_state.etfs[t]['name']}",
-            key="deep_pick",
-        )
+        _dc1, _dc2 = st.columns([3, 2])
+        with _dc1:
+            _pick = st.selectbox(
+                "ETF",
+                options=_tickers,
+                format_func=lambda t: f"{t} — {st.session_state.etfs[t]['name']}",
+                key="deep_pick",
+                label_visibility="collapsed",
+            )
+        with _dc2:
+            _tf_deep = timeframe_selector("tf_deep", default="6M")
         _info = st.session_state.etfs[_pick]
         _pd = st.session_state.price_data.get(_pick)
 
@@ -1336,9 +1733,12 @@ with tab_deep:
                 f"No price data for {_pick}. Click ↻ Refresh prices in the sidebar."
             )
         else:
-            _hist = _pd["history"].copy()
-            _hist["date"] = pd.to_datetime(_hist["date"])
-            _hist = _hist.sort_values("date").reset_index(drop=True)
+            _hist_full = _pd["history"].copy()
+            _hist_full["date"] = pd.to_datetime(_hist_full["date"])
+            _hist_full = _hist_full.sort_values("date").reset_index(drop=True)
+            _hist = slice_history(_hist_full, _tf_deep)
+            if _hist is None or _hist.empty:
+                _hist = _hist_full
 
             # ----- key stats cards
             kc1, kc2, kc3, kc4 = st.columns(4)
@@ -1379,8 +1779,8 @@ with tab_deep:
 
             st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
-            # ----- Price + volume (last 120 sessions)
-            _h120 = _hist.tail(120)
+            # ----- Price + volume (windowed by selected time frame)
+            _h120 = _hist  # already time-frame windowed above
             _has_ohlc_cols = {"open", "high", "low"}.issubset(set(_h120.columns))
             _has_vol_col = "volume" in _h120.columns
 
@@ -1392,7 +1792,7 @@ with tab_deep:
                 fig_c = go.Figure()
 
             if _has_ohlc_cols:
-                st.caption("Price · last 120 sessions (candlestick + volume)")
+                st.caption(f"Price · {_tf_deep} (candlestick + volume)")
                 fig_c.add_trace(go.Candlestick(
                     x=_h120["date"],
                     open=_h120["open"], high=_h120["high"],
@@ -1402,7 +1802,7 @@ with tab_deep:
                     name=_pick, showlegend=False,
                 ), row=1, col=1)
             else:
-                st.caption("Price · last 120 sessions")
+                st.caption(f"Price · {_tf_deep}")
                 _price_kwargs = {"row": 1, "col": 1} if _has_vol_col else {}
                 fig_c.add_trace(go.Scatter(
                     x=_h120["date"], y=_h120["price"], mode="lines",
@@ -1487,7 +1887,7 @@ with tab_deep:
             _peak = _close.cummax()
             _dd = (_close / _peak - 1.0) * 100.0
             with dd_col:
-                st.caption("Drawdown from running peak")
+                st.caption(f"Drawdown from running peak · {_tf_deep}")
                 fig_d = go.Figure()
                 fig_d.add_trace(go.Scatter(
                     x=_hist["date"], y=_dd, mode="lines",
@@ -1506,7 +1906,7 @@ with tab_deep:
                 st.plotly_chart(fig_d, use_container_width=True, config={"displayModeBar": False})
 
             with vol_col:
-                st.caption("Rolling 30d volatility (annualised)")
+                st.caption(f"Rolling 30d volatility · {_tf_deep} (annualised)")
                 _daily_ret = _close.pct_change()
                 _rvol = _daily_ret.rolling(30).std() * (252 ** 0.5) * 100
                 fig_v = go.Figure()
@@ -1529,7 +1929,7 @@ with tab_deep:
             # ----- Returns histogram + monthly heatmap
             hi_col, hm_col = st.columns(2)
             with hi_col:
-                st.caption("Daily returns distribution")
+                st.caption(f"Daily returns distribution · {_tf_deep}")
                 _r = _daily_ret.dropna() * 100
                 if len(_r):
                     fig_h = go.Figure()
@@ -1550,8 +1950,9 @@ with tab_deep:
                     st.plotly_chart(fig_h, use_container_width=True, config={"displayModeBar": False})
 
             with hm_col:
-                st.caption("Monthly returns · last 24 months")
-                _mhist = _hist.set_index("date")["price"].astype(float)
+                st.caption("Monthly returns · last 24 months (full history)")
+                # Heatmap always uses full history regardless of selected window
+                _mhist = _hist_full.set_index("date")["price"].astype(float)
                 _monthly = _mhist.resample("ME").last().pct_change().dropna() * 100
                 _monthly = _monthly.tail(24)
                 if len(_monthly):

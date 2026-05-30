@@ -731,6 +731,512 @@ def score_band_color(score):
     return None  # default border
 
 
+# -----------------------------------------------------------------------------
+# Plain-English callout explanations (no API)
+# -----------------------------------------------------------------------------
+
+CALLOUT_EXPLANATIONS = {
+    "big loss": {
+        "explain": (
+            "{TICKER} is down {pnl_pct:+.1f}% from your entry of "
+            "£{avg_price:,.2f}. Unrealised loss of {pnl_abs_money}."
+        ),
+        "actions": [
+            "If your thesis is intact, consider averaging down — lowers your blended cost basis",
+            "If your thesis has changed, consider closing — keep losses limited",
+            "Decide your stop-loss floor in advance, before emotions kick in",
+        ],
+    },
+    "deep drawdown": {
+        "explain": (
+            "{TICKER} is {drawdown:.1f}% below its 52-week high of "
+            "£{high_52w:,.2f} — a significant retracement."
+        ),
+        "actions": [
+            "Check recent news — is this sector-wide or ETF-specific?",
+            "Compare to sector peers to see if you're being unfairly punished",
+            "Set a hard stop-loss if you don't want to risk further downside",
+        ],
+    },
+    "death cross": {
+        "explain": (
+            "{TICKER}'s 50-day moving average has crossed below its 200-day. "
+            "Classic technical signal that the medium-term trend has turned bearish."
+        ),
+        "actions": [
+            "Watch for confirmation — does price keep declining over the next few sessions?",
+            "Trim if heavily allocated; the signal is often noisy in isolation",
+            "Verify with fundamentals before acting — death crosses sometimes whipsaw",
+        ],
+    },
+    "high vol": {
+        "explain": (
+            "{TICKER}'s 30-day annualised volatility is {vol_30d:.1f}%. "
+            "That's elevated — daily swings are larger than the broader market (~15%)."
+        ),
+        "actions": [
+            "Keep position size proportionate to your risk tolerance",
+            "Use limit orders during volatile sessions to avoid being whipsawed",
+            "Pair with lower-vol positions to smooth the overall portfolio ride",
+        ],
+    },
+    "overbought": {
+        "explain": (
+            "{TICKER}'s 14-day RSI is above 70 — it has been rising quickly. "
+            "Historically this can precede a short-term pullback."
+        ),
+        "actions": [
+            "If you're considering adding, wait for a pullback to a lower RSI",
+            "If overweight, consider taking partial profits",
+            "RSI alone isn't predictive — combine with trend signals before acting",
+        ],
+    },
+    "low score": {
+        "explain": (
+            "{TICKER}'s composite score is {score:.0f} (0–100). "
+            "Low scores mean several weak signals are stacked: momentum, drawdown, "
+            "MA crosses, and RSI."
+        ),
+        "actions": [
+            "Inspect the individual signal chips on the card to see which are firing",
+            "Compare to your other holdings — does it still deserve the capital?",
+            "Wait for the score to improve before adding new capital",
+        ],
+    },
+    "big win": {
+        "explain": (
+            "{TICKER} is up {pnl_pct:+.1f}% from your entry of "
+            "£{avg_price:,.2f}. Unrealised gain of {pnl_abs_money}."
+        ),
+        "actions": [
+            "Take partial profits to lock in some gain and reduce concentration",
+            "Rebalance if this position has grown beyond your target allocation",
+            "Hold if conviction is strong — let winners run",
+        ],
+    },
+    "golden cross": {
+        "explain": (
+            "{TICKER}'s 50-day moving average has crossed above its 200-day. "
+            "Classic bullish technical signal: medium-term trend in line with long-term."
+        ),
+        "actions": [
+            "If considering a top-up, the trend is supportive",
+            "Set a stop-loss in case the signal reverses (whipsaws happen)",
+            "Watch for volume confirmation — real breakouts usually show expanding volume",
+        ],
+    },
+    "hot streak": {
+        "explain": (
+            "{TICKER} is near its 52-week high AND has positive 1-month momentum. "
+            "Sustained uptrend."
+        ),
+        "actions": [
+            "Don't chase — wait for a pullback before adding",
+            "Take partial profits if you're overweight relative to target",
+            "Tighten your stop-loss to protect gains",
+        ],
+    },
+    "oversold dip": {
+        "explain": (
+            "{TICKER}'s 14-day RSI is below 30 — possibly temporarily oversold. "
+            "Historically this can precede a short-term bounce."
+        ),
+        "actions": [
+            "Cautious add if conviction is intact",
+            "Don't catch a falling knife — wait for price to stabilise (e.g. close > 5-day SMA)",
+            "Combine with longer-term trend signals before acting",
+        ],
+    },
+}
+
+
+def render_explanations(neg_by_ticker, pos_by_ticker):
+    """Foldout panel: per-ticker explanations + recommended actions. No API."""
+    all_tickers = list(neg_by_ticker.keys()) + [
+        t for t in pos_by_ticker if t not in neg_by_ticker
+    ]
+    if not all_tickers:
+        return
+
+    with st.expander("Why these flags? Explanations & suggested actions", expanded=False):
+        for t in all_tickers:
+            info = st.session_state.etfs.get(t) or {}
+            pd_  = st.session_state.price_data.get(t) or {}
+            pnl  = position_pnl(t)
+            sig  = (st.session_state.signals_data.get(t) or {})
+            ctx = {
+                "TICKER":     t,
+                "avg_price":  float(info.get("avg_price") or 0),
+                "drawdown":   float(pd_.get("drawdown") or 0),
+                "high_52w":   float(pd_.get("high_52w") or 0),
+                "vol_30d":    float(pd_.get("vol_30d") or 0),
+                "score":      float(sig.get("score") or 50.0),
+                "pnl_pct":    float(pnl[3]) if pnl else 0.0,
+                "pnl_abs_money": fmt_money(pnl[2]) if pnl else "£0",
+            }
+            with st.container(border=True):
+                st.markdown(
+                    f"<div class='mono' style='font-size:13px;font-weight:700;'>"
+                    f"{t} <span style='font-weight:400;color:#64748B;font-family:Helvetica Neue;'>"
+                    f"· {info.get('name','')}</span></div>",
+                    unsafe_allow_html=True,
+                )
+                tags = (
+                    [("neg", *tag) for tag in neg_by_ticker.get(t, [])]
+                    + [("pos", *tag) for tag in pos_by_ticker.get(t, [])]
+                )
+                for _kind, name, sub, fg, _bg in tags:
+                    template = CALLOUT_EXPLANATIONS.get(name)
+                    if not template:
+                        continue
+                    try:
+                        explain = template["explain"].format(**ctx)
+                    except Exception:
+                        explain = template["explain"]
+                    bullets = "".join(
+                        f"<li style='margin-bottom:3px;'>{a}</li>"
+                        for a in template["actions"]
+                    )
+                    icon = "🟢" if _kind == "pos" else ("🔴" if fg == "#EF4444" else "🟠")
+                    sub_html = f" · {sub}" if sub else ""
+                    st.markdown(
+                        f"<div style='margin-top:10px;padding-left:10px;border-left:2px solid {fg};'>"
+                        f"<div style='font-size:12px;font-weight:600;color:{fg};'>"
+                        f"{icon} {name.title()}{sub_html}</div>"
+                        f"<div style='font-size:12px;color:#0F172A;margin:4px 0 6px 0;line-height:1.45;'>{explain}</div>"
+                        f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:0.08em;'>Consider</div>"
+                        f"<ul style='font-size:12px;color:#0F172A;margin:3px 0 0 16px;padding:0;'>"
+                        f"{bullets}"
+                        f"</ul>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+# -----------------------------------------------------------------------------
+# Portfolio-level suggestion detectors (no API, rule-based)
+# -----------------------------------------------------------------------------
+
+def _detect_drawdown_cluster(state):
+    flagged = [
+        t for t in state.etfs
+        if (state.signals_data.get(t) or {}).get("flags", {}).get("deep_drawdown")
+    ]
+    if len(flagged) < 3:
+        return None
+    return {
+        "severity": "caution",
+        "title": "Drawdown cluster detected",
+        "body": (
+            f"{len(flagged)} of your {len(state.etfs)} ETFs are in deep drawdown "
+            f"({', '.join(flagged)}). When multiple positions retrace together it's "
+            "usually market-wide rather than ETF-specific — actions differ from a "
+            "single isolated drop."
+        ),
+        "actions": [
+            "Check broad-market news to confirm whether this is sector-wide",
+            "Resist averaging down on every position at once — prioritise highest conviction",
+            "Review risk tolerance: would you hold if it dropped another 10%?",
+        ],
+        "tickers": flagged,
+    }
+
+
+def _detect_risk_concentration(state):
+    contribs = []
+    for t, _info in state.etfs.items():
+        pd_ = state.price_data.get(t) or {}
+        vol = pd_.get("vol_30d")
+        alloc = state.allocs.get(t, 0.0)
+        if vol is None or alloc <= 0:
+            continue
+        contribs.append((t, alloc * float(vol)))
+    if len(contribs) < 4:
+        return None
+    contribs.sort(key=lambda x: x[1], reverse=True)
+    total = sum(c[1] for c in contribs)
+    if total <= 0:
+        return None
+    top3 = contribs[:3]
+    top3_share = sum(c[1] for c in top3) / total * 100
+    if top3_share <= 65:
+        return None
+    return {
+        "severity": "caution",
+        "title": f"Risk concentrated in {top3[0][0]}, {top3[1][0]}, {top3[2][0]}",
+        "body": (
+            f"These three positions drive about {top3_share:.0f}% of your "
+            "portfolio's weighted volatility — a shock to any one of them "
+            "dominates your daily P/L."
+        ),
+        "actions": [
+            "Review whether you're comfortable with the concentration",
+            "Consider trimming if these aren't your highest-conviction holds",
+            "Pair with lower-vol positions to smooth overall portfolio risk",
+        ],
+        "tickers": [c[0] for c in top3],
+    }
+
+
+def _detect_underweight_winner(state):
+    candidates = []
+    for t in state.etfs:
+        pnl = position_pnl(t)
+        if not pnl:
+            continue
+        _, _, _, pnl_pct = pnl
+        alloc = state.allocs.get(t, 0.0)
+        if pnl_pct > 10 and alloc < 10:
+            candidates.append((t, pnl_pct, alloc))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    t, pct, alloc = candidates[0]
+    return {
+        "severity": "opportunity",
+        "title": f"{t} is winning but underallocated",
+        "body": (
+            f"{t} is up {pct:+.1f}% but only {alloc:.1f}% of your portfolio. "
+            "If conviction is intact, you may be capturing too little of the upside."
+        ),
+        "actions": [
+            "Top up to your target weight if your view hasn't changed",
+            "Or let it ride — don't chase momentum at higher prices",
+            "Update your target allocation if your conviction has evolved",
+        ],
+        "tickers": [t],
+    }
+
+
+def _detect_overweight_loser(state):
+    candidates = []
+    for t in state.etfs:
+        pnl = position_pnl(t)
+        if not pnl:
+            continue
+        _, _, _, pnl_pct = pnl
+        alloc = state.allocs.get(t, 0.0)
+        if pnl_pct < -5 and alloc > 20:
+            candidates.append((t, pnl_pct, alloc))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    t, pct, alloc = candidates[0]
+    return {
+        "severity": "caution",
+        "title": f"{t} is losing but overallocated",
+        "body": (
+            f"{t} is down {pct:+.1f}% AND makes up {alloc:.1f}% of your "
+            "portfolio. Outsized losses hurt the whole portfolio."
+        ),
+        "actions": [
+            "Trim if your thesis has weakened",
+            "Hold if conviction is intact, but set a stop-loss",
+            "Avoid adding more — the 'average down' trap is real",
+        ],
+        "tickers": [t],
+    }
+
+
+def _detect_allocation_drift(state):
+    # Need cost basis to compute current value weights
+    held_values = {}
+    for t in state.etfs:
+        pnl = position_pnl(t)
+        if pnl:
+            value, _, _, _ = pnl
+            held_values[t] = value
+    if not held_values:
+        return None
+    total = sum(held_values.values())
+    if total <= 0:
+        return None
+    drifts = []
+    for t, value in held_values.items():
+        current_pct = value / total * 100
+        target_pct = state.allocs.get(t, 0.0)
+        diff = current_pct - target_pct
+        if abs(diff) > 5:
+            drifts.append((t, target_pct, current_pct, diff))
+    if not drifts:
+        return None
+    drifts.sort(key=lambda x: abs(x[3]), reverse=True)
+    top = drifts[:3]
+    body_parts = []
+    for t, tgt, curr, diff in top:
+        direction = "grown above" if diff > 0 else "drifted below"
+        body_parts.append(
+            f"<b>{t}</b> targeted {tgt:.1f}%, now {curr:.1f}% ({direction} target)"
+        )
+    return {
+        "severity": "rebalance",
+        "title": f"Allocation drift on {len(drifts)} position{'s' if len(drifts) != 1 else ''}",
+        "body": (
+            "Position weights have moved more than 5pp from their targets due "
+            "to price changes:<br>" + "<br>".join(body_parts)
+        ),
+        "actions": [
+            "Rebalance back to target by trimming overweights / topping up underweights",
+            "Or update target weights if your view has evolved",
+            "Drift is normal — pick a threshold (e.g. 5pp) and stick to it",
+        ],
+        "tickers": [d[0] for d in top],
+    }
+
+
+def _detect_take_profit_candidate(state):
+    candidates = []
+    for t in state.etfs:
+        pnl = position_pnl(t)
+        if not pnl:
+            continue
+        _, _, _, pnl_pct = pnl
+        flags = (state.signals_data.get(t) or {}).get("flags", {})
+        if pnl_pct > 10 and flags.get("near_52w_high"):
+            candidates.append((t, pnl_pct))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    t, pct = candidates[0]
+    return {
+        "severity": "opportunity",
+        "title": f"{t} sitting at highs — consider profit-taking",
+        "body": (
+            f"{t} is up {pct:+.1f}% from your entry AND trading near its "
+            "52-week high. Trimming locks in gains and reduces concentration."
+        ),
+        "actions": [
+            "Sell a portion to crystallise gains",
+            "Set a trailing stop on the remainder to lock in profits if it reverses",
+            "Hold if conviction is strong — let winners run",
+        ],
+        "tickers": [t],
+    }
+
+
+def _detect_stop_loss_candidate(state):
+    candidates = []
+    for t in state.etfs:
+        pnl = position_pnl(t)
+        if not pnl:
+            continue
+        _, _, _, pnl_pct = pnl
+        pd_ = state.price_data.get(t) or {}
+        flags = (state.signals_data.get(t) or {}).get("flags", {})
+        dd = pd_.get("drawdown") or 0
+        trigger = (flags.get("death_cross") or dd < -20)
+        if pnl_pct < -5 and trigger:
+            candidates.append((t, pnl_pct, dd, flags.get("death_cross", False)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1])
+    t, pct, dd, has_dc = candidates[0]
+    reason = "death cross signal" if has_dc else f"drawdown of {dd:.1f}%"
+    return {
+        "severity": "caution",
+        "title": f"{t} at decision point",
+        "body": (
+            f"{t} is down {pct:+.1f}% with a bearish trend signal ({reason}). "
+            "Time to revisit your thesis."
+        ),
+        "actions": [
+            "Decide a hard stop-loss floor — and stick to it",
+            "If thesis has changed, close — don't anchor to your entry price",
+            "If thesis intact, set strict exit criteria for the next 30 days",
+        ],
+        "tickers": [t],
+    }
+
+
+def _detect_oversold_cluster(state):
+    flagged = [
+        t for t in state.etfs
+        if (state.signals_data.get(t) or {}).get("flags", {}).get("rsi_oversold")
+    ]
+    if len(flagged) < 2:
+        return None
+    return {
+        "severity": "opportunity",
+        "title": "Multiple oversold positions",
+        "body": (
+            f"{', '.join(flagged)} are showing RSI < 30. Could be a short-term "
+            "bounce setup — though oversold can stay oversold."
+        ),
+        "actions": [
+            "Consider partial entries — don't go all-in on oversold",
+            "Wait for stabilisation (price > 5-day SMA) before committing capital",
+            "Combine with longer-term trend signals before acting",
+        ],
+        "tickers": flagged,
+    }
+
+
+SUGGESTION_DETECTORS = [
+    _detect_drawdown_cluster,
+    _detect_risk_concentration,
+    _detect_underweight_winner,
+    _detect_overweight_loser,
+    _detect_allocation_drift,
+    _detect_take_profit_candidate,
+    _detect_stop_loss_candidate,
+    _detect_oversold_cluster,
+]
+
+
+def compute_suggestions():
+    """Run all detectors against current session_state; return sorted list of suggestions."""
+    out = []
+    for detector in SUGGESTION_DETECTORS:
+        try:
+            result = detector(st.session_state)
+        except Exception:
+            continue
+        if result:
+            out.append(result)
+    sev_order = {"caution": 0, "rebalance": 1, "opportunity": 2}
+    out.sort(key=lambda s: sev_order.get(s.get("severity"), 9))
+    return out
+
+
+def render_suggestions(suggestions):
+    """Render the list of suggestion cards. Shows an empty-state info when none."""
+    if not suggestions:
+        st.info("Your portfolio looks balanced — no automatic suggestions right now.")
+        return
+    sev_meta = {
+        "caution":     ("#EF4444", "🔴", "Caution"),
+        "rebalance":   ("#F59E0B", "🟡", "Rebalance"),
+        "opportunity": ("#00C896", "🟢", "Opportunity"),
+    }
+    for s in suggestions:
+        fg, icon, label = sev_meta.get(s.get("severity"), ("#64748B", "•", ""))
+        bullets = "".join(
+            f"<li style='margin-bottom:3px;'>{a}</li>" for a in s.get("actions", [])
+        )
+        ticker_chips = "".join(
+            f"<span class='mono' style='background:#F1F5F9;color:#0F172A;"
+            f"font-size:11px;font-weight:600;padding:2px 6px;border-radius:3px;"
+            f"margin-right:4px;'>{t}</span>"
+            for t in s.get("tickers", [])
+        )
+        with st.container(border=True):
+            st.markdown(
+                f"<div style='border-left:3px solid {fg};padding-left:12px;'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:baseline;gap:10px;'>"
+                f"<span style='font-size:14px;font-weight:600;color:#0F172A;'>{s['title']}</span>"
+                f"<span style='background:{fg}22;color:{fg};font-size:10px;font-weight:700;"
+                f"padding:3px 8px;border-radius:4px;letter-spacing:0.06em;white-space:nowrap;'>"
+                f"{icon} {label.upper()}</span>"
+                f"</div>"
+                f"<div style='font-size:13px;color:#0F172A;margin-top:6px;line-height:1.5;'>{s['body']}</div>"
+                f"<div style='font-size:10px;color:#64748B;margin-top:10px;text-transform:uppercase;letter-spacing:0.08em;'>Consider</div>"
+                f"<ul style='font-size:12px;color:#0F172A;margin:4px 0 0 18px;padding:0;'>{bullets}</ul>"
+                + (f"<div style='margin-top:10px;'>{ticker_chips}</div>" if ticker_chips else "")
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+
 # =============================================================================
 # Popover (re-uses helpers above)
 # =============================================================================
@@ -1270,6 +1776,21 @@ with tab_over:
 
     _render_pill_row("Needs attention", _neg_by_ticker)
     _render_pill_row("Good shape", _pos_by_ticker)
+
+    # ---- Plain-English explanations + recommended actions (foldout, no API)
+    render_explanations(_neg_by_ticker, _pos_by_ticker)
+
+    # ---- Pointer to the Insights tab when portfolio-level suggestions exist
+    _suggestions_n = len(compute_suggestions())
+    if _suggestions_n > 0:
+        _word = "suggestion" if _suggestions_n == 1 else "suggestions"
+        st.markdown(
+            f"<div style='font-size:12px;color:#64748B;margin-top:10px;'>"
+            f"💡 {_suggestions_n} portfolio {_word} available in the "
+            f"<b style='color:#0F172A;'>Insights</b> tab"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     # "What changed since last refresh" strip
     st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
@@ -2021,6 +2542,17 @@ with tab_deep:
 
 # ----------------------------------------------------------------------------- Insights (manual)
 with tab_ai:
+    # ---- Suggestions section (auto-generated, no API)
+    _suggestions = compute_suggestions()
+    st.markdown(
+        "<div style='font-size:13px;font-weight:600;letter-spacing:0.04em;"
+        "text-transform:uppercase;color:#64748B;margin-bottom:8px;'>"
+        "💡 Suggestions · automatic, no API</div>",
+        unsafe_allow_html=True,
+    )
+    render_suggestions(_suggestions)
+    st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
+
     # ---- News section
     st.markdown(
         "<div style='font-size:13px;font-weight:600;letter-spacing:0.04em;"
